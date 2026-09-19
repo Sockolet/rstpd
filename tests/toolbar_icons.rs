@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use rstpad::{
+use rstpd::{
     editor::Palette,
     toolbar::{self, Icon, Tooltips},
 };

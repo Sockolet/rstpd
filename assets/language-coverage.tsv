@@ -1,5 +1,5 @@
 # Language/extension inventory facts checked against langs.model.xml modelDate 20260714 on 2026-09-19.
-# upstream name|RSTPad mode|extensions
+# upstream name|rstpd mode|extensions
 # searchResult is an internal result-pane format, not a source-file language.
 normal|Plain text|txt
 actionscript|ActionScript|as mx

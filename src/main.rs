@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"]
 
 fn main() {
-    if let Err(error) = rstpad::ui::run() {
-        rstpad::ui::show_error(&error);
+    if let Err(error) = rstpd::ui::run() {
+        rstpd::ui::show_error(&error);
     }
 }

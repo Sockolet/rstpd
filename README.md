@@ -1,4 +1,4 @@
-# RSTPad
+# rstpd
 
 A lightweight, native Windows text editor: a new Rust application, not a
 Notepad++ port. No plugins, extension discovery, embedded browser, command
@@ -14,23 +14,23 @@ application code or plugin code is included.
 ## Run
 
 Download the portable Windows ZIP from the
-[GitHub releases](https://github.com/Sockolet/rstpad/releases).
+[GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\RSTPad-0.2.3\rstpad.exe`, or extract the portable ZIP and open
-`RSTPad-0.2.3\rstpad.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-0.2.4\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-0.2.4\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\RSTPad-0.2.3\rstpad.exe
-.\dist\RSTPad-0.2.3\rstpad.exe .\example.rs .\example.json
+.\dist\rstpd-0.2.4\rstpd.exe
+.\dist\rstpd-0.2.4\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
 instance may use a session directory at a time. Opening another instance
 does not forward filenames to the existing instance.
 
-Close an older RSTPad instance before opening this release with the same session.
+Close an older rstpd instance before opening this release with the same session.
 Version 0.2 reads version-1 sessions and saves version-2 sessions, including
 language/completion definitions. Version 0.1 deliberately refuses version-2
 sessions rather than silently dropping the new settings.
@@ -122,8 +122,8 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\RSTPad-0.2.3\rstpad.exe --import-language .\language.xml .\example.rstlang
-.\dist\RSTPad-0.2.3\rstpad.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-0.2.4\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-0.2.4\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -159,8 +159,12 @@ the document. Regex errors are reported, not treated as "no match".
 ## Recovery and data safety
 
 Recovery is stored as **plaintext** in
-`%LOCALAPPDATA%\RSTPad\session.json`, under the user's normal directory
+`%LOCALAPPDATA%\rstpd\session.json`, under the user's normal directory
 permissions. This may include sensitive unsaved text. Nothing is uploaded.
+Existing installations with recovery state in `%LOCALAPPDATA%\RSTPad` keep
+using that legacy folder, including its lock file, unless recovery state
+already exists in the new `rstpd` folder. Nothing is moved or deleted during
+the rename. `--session-dir` still explicitly selects a separate session.
 Snapshots run approximately every three seconds after changes; a crash can
 lose edits since the last completed snapshot. Normal exit waits for the final
 snapshot and refuses to exit if that save fails.
@@ -215,7 +219,7 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\RSTPad-0.2.3-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-0.2.4-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.
@@ -259,7 +263,7 @@ live editing, split/map views and recovery, rather than only checking lexer IDs.
 
 There is no runtime lexer DLL loading or plugin path. The build reads only
 language keyword/style data from SciTE; none of SciTE's commands or application
-code are compiled into RSTPad. JSON nodes are plain text, not rendered HTML.
+code are compiled into rstpd. JSON nodes are plain text, not rendered HTML.
 Document contents do not launch programs or fetch resources.
 
 Native document references have explicit ownership and automatic release,

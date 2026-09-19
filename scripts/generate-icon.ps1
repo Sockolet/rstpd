@@ -27,7 +27,7 @@ foreach ($size in @(16,32,48,256)) {
         $graphics.Dispose(); $bitmap.Dispose()
     }
 }
-$output = Join-Path (Split-Path $PSScriptRoot -Parent) 'assets\rstpad.ico'
+$output = Join-Path (Split-Path $PSScriptRoot -Parent) 'assets\rstpd.ico'
 $writer = [IO.BinaryWriter]::new([IO.File]::Create($output))
 try {
     $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]$images.Count)

@@ -23,7 +23,7 @@ use sci::*;
 
 unsafe extern "C" {
     fn Scintilla_RegisterClasses(instance: HINSTANCE) -> i32;
-    fn rstpad_document_release(document: *mut c_void);
+    fn rstpd_document_release(document: *mut c_void);
 }
 unsafe extern "system" {
     fn CreateLexer(name: *const i8) -> *mut c_void;
@@ -213,7 +213,7 @@ impl Drop for DocumentHandle {
     fn drop(&mut self) {
         // The owned reference survives view destruction; release through the pinned public interface.
         unsafe {
-            rstpad_document_release(self.raw.as_ptr());
+            rstpd_document_release(self.raw.as_ptr());
         }
     }
 }

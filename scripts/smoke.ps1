@@ -1,11 +1,11 @@
-param([string]$Executable = "$PSScriptRoot\..\target\debug\rstpad.exe")
+param([string]$Executable = "$PSScriptRoot\..\target\debug\rstpd.exe")
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-public static class RstpadSmoke {
+public static class RstpdSmoke {
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h, int id);
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, string l);
@@ -25,8 +25,10 @@ public static class RstpadSmoke {
 $root = Split-Path $PSScriptRoot -Parent
 $directory = Join-Path $root "target\smoke-$([Guid]::NewGuid().ToString('N'))"
 $firstProfile = Join-Path $directory 'fresh-profile'
-$firstSessionDirectory = Join-Path $firstProfile 'RSTPad'
+$firstSessionDirectory = Join-Path $firstProfile 'rstpd'
 $firstSession = Join-Path $firstSessionDirectory 'session.json'
+$legacySessionDirectory = Join-Path $firstProfile 'RSTPad'
+$legacySession = Join-Path $legacySessionDirectory 'session.json'
 New-Item -ItemType Directory $directory | Out-Null
 Copy-Item "$root\tests\fixtures\before.json" (Join-Path $directory 'before.json')
 Copy-Item "$root\tests\fixtures\after.json" (Join-Path $directory 'after.json')
@@ -71,24 +73,25 @@ function Start-Editor([bool]$fixtures, [bool]$defaultSession = $false, [string[]
     Assert ($script:window -ne 0) 'Main window did not appear.'
     Start-Sleep -Milliseconds 300
     Assert-Running
+    Assert ((Caption $script:window) -match ' - rstpd$') 'Application window still uses the old tool name.'
 }
 function Close-Editor {
-    [RstpadSmoke]::PostMessage($script:window,0x10,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+    [RstpdSmoke]::PostMessage($script:window,0x10,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
     Assert ($script:process.WaitForExit(10000)) 'App did not flush and close.'
     Assert ($script:process.ExitCode -eq 0) "App exited with code $($script:process.ExitCode)."
 }
 function Command([int]$id) {
     $button=Control $id
     if ($button -ne [IntPtr]::Zero -and $id -in @(1001,1002,1003,1040,1050,1051,1070,1082)) {
-        [RstpadSmoke]::PostMessage($button,0xF5,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+        [RstpdSmoke]::PostMessage($button,0xF5,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
     } else {
-        [RstpadSmoke]::PostMessage($script:window,0x111,[IntPtr]$id,[IntPtr]::Zero) | Out-Null
+        [RstpdSmoke]::PostMessage($script:window,0x111,[IntPtr]$id,[IntPtr]::Zero) | Out-Null
     }
     Start-Sleep -Milliseconds 200
 }
-function Control([int]$id) { [RstpadSmoke]::GetDlgItem($script:window,$id) }
+function Control([int]$id) { [RstpdSmoke]::GetDlgItem($script:window,$id) }
 function Number([IntPtr]$handle,[uint32]$message,[long]$w = 0,[long]$l = 0) {
-    [RstpadSmoke]::SendMessage($handle,$message,[IntPtr]$w,[IntPtr]$l).ToInt64()
+    [RstpdSmoke]::SendMessage($handle,$message,[IntPtr]$w,[IntPtr]$l).ToInt64()
 }
 function Wait-Until([scriptblock]$condition,[string]$message) {
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
@@ -101,37 +104,37 @@ function Wait-Until([scriptblock]$condition,[string]$message) {
 }
 function Type-Text([string]$text) {
     foreach ($character in $text.ToCharArray()) {
-        [RstpadSmoke]::SendMessage((Control 101),0x102,[IntPtr][int]$character,[IntPtr]::Zero) | Out-Null
+        [RstpdSmoke]::SendMessage((Control 101),0x102,[IntPtr][int]$character,[IntPtr]::Zero) | Out-Null
     }
 }
 function Caption([IntPtr]$handle) {
     $text = [Text.StringBuilder]::new(4096)
-    [RstpadSmoke]::GetWindowText($handle,$text,$text.Capacity) | Out-Null
+    [RstpdSmoke]::GetWindowText($handle,$text,$text.Capacity) | Out-Null
     $text.ToString()
 }
 function Check-LanguageMenu([bool]$custom) {
-    $menu=[RstpadSmoke]::GetSubMenu([RstpadSmoke]::GetMenu($script:window),5)
+    $menu=[RstpdSmoke]::GetSubMenu([RstpdSmoke]::GetMenu($script:window),5)
     Assert ($menu -ne [IntPtr]::Zero) 'Language menu is missing.'
-    Assert ([RstpadSmoke]::GetMenuItemID($menu,0) -eq 2000) 'Plain text is not directly accessible.'
-    $count=[RstpadSmoke]::GetMenuItemCount($menu)
+    Assert ([RstpdSmoke]::GetMenuItemID($menu,0) -eq 2000) 'Plain text is not directly accessible.'
+    $count=[RstpdSmoke]::GetMenuItemCount($menu)
     Assert ($count -eq $(if ($custom) {15} else {14})) 'Language menu contains unexpected top-level categories.'
     $letters=@('a','d','g','j','m','p','s','v')
     $ids=[Collections.Generic.List[uint32]]::new()
     $ids.Add(2000)
     for ($index=0; $index -lt $letters.Count; $index++) {
-        $mnemonic=[RstpadSmoke]::SendMessage($script:window,0x120,[IntPtr][int][char]$letters[$index],$menu).ToInt64()
+        $mnemonic=[RstpdSmoke]::SendMessage($script:window,0x120,[IntPtr][int][char]$letters[$index],$menu).ToInt64()
         Assert (($mnemonic -shr 16) -eq 2 -and ($mnemonic -band 0xffff) -eq ($index+2)) 'Alphabetical language group has an incorrect label or mnemonic.'
-        $group=[RstpadSmoke]::GetSubMenu($menu,$index+2)
+        $group=[RstpdSmoke]::GetSubMenu($menu,$index+2)
         Assert ($group -ne [IntPtr]::Zero) 'Language letter group is missing.'
-        for ($item=0; $item -lt [RstpadSmoke]::GetMenuItemCount($group); $item++) {
-            $ids.Add([RstpadSmoke]::GetMenuItemID($group,$item))
+        for ($item=0; $item -lt [RstpdSmoke]::GetMenuItemCount($group); $item++) {
+            $ids.Add([RstpdSmoke]::GetMenuItemID($group,$item))
         }
     }
     if ($custom) {
-        $group=[RstpadSmoke]::GetSubMenu($menu,10)
+        $group=[RstpdSmoke]::GetSubMenu($menu,10)
         Assert ($group -ne [IntPtr]::Zero) 'User-defined languages are not separate.'
-        for ($item=0; $item -lt [RstpadSmoke]::GetMenuItemCount($group); $item++) {
-            $ids.Add([RstpadSmoke]::GetMenuItemID($group,$item))
+        for ($item=0; $item -lt [RstpdSmoke]::GetMenuItemCount($group); $item++) {
+            $ids.Add([RstpdSmoke]::GetMenuItemID($group,$item))
         }
     }
     $sorted=@($ids | Sort-Object)
@@ -139,10 +142,10 @@ function Check-LanguageMenu([bool]$custom) {
     for ($index=0; $index -lt $sorted.Count; $index++) {
         Assert ($sorted[$index] -eq 2000+$index) 'A language command is missing, duplicated or misnumbered.'
     }
-    Assert ([RstpadSmoke]::GetMenuItemID($menu,$count-3) -eq 1400) 'Language management commands are not at the bottom.'
+    Assert ([RstpdSmoke]::GetMenuItemID($menu,$count-3) -eq 1400) 'Language management commands are not at the bottom.'
 }
 function Screenshot([string]$name) {
-    $previous = [RstpadSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    $previous = [RstpdSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
     $renderers = @()
     try {
         # DirectWrite capture can be blank on an inactive/remote desktop. Use GDI only for the capture.
@@ -151,19 +154,19 @@ function Screenshot([string]$name) {
             $renderers += @{ Handle=$control; Technology=(Number $control 2631) }
             Number $control 2630 0 | Out-Null
         }
-        $rect = [RstpadSmoke+Rect]::new()
-        [RstpadSmoke]::GetWindowRect($script:window,[ref]$rect) | Out-Null
+        $rect = [RstpdSmoke+Rect]::new()
+        [RstpdSmoke]::GetWindowRect($script:window,[ref]$rect) | Out-Null
         $bitmap = [Drawing.Bitmap]::new($rect.right-$rect.left,$rect.bottom-$rect.top)
         try {
             $graphics = [Drawing.Graphics]::FromImage($bitmap)
             $dc = $graphics.GetHdc()
-            try { Assert ([RstpadSmoke]::PrintWindow($script:window,$dc,2)) 'Window capture failed.' }
+            try { Assert ([RstpdSmoke]::PrintWindow($script:window,$dc,2)) 'Window capture failed.' }
             finally { $graphics.ReleaseHdc($dc); $graphics.Dispose() }
             $bitmap.Save((Join-Path $root "target\$name"),[Drawing.Imaging.ImageFormat]::Png)
         } finally { $bitmap.Dispose() }
     } finally {
         foreach ($renderer in $renderers) { Number $renderer.Handle 2630 $renderer.Technology | Out-Null }
-        if ($previous -ne [IntPtr]::Zero) { [RstpadSmoke]::SetThreadDpiAwarenessContext($previous) | Out-Null }
+        if ($previous -ne [IntPtr]::Zero) { [RstpdSmoke]::SetThreadDpiAwarenessContext($previous) | Out-Null }
     }
 }
 try {
@@ -171,7 +174,7 @@ try {
     Assert ((Number (Control 302) 0x1304) -eq 1) 'First launch must create one untitled tab.'
     Assert ((Number (Control 101) 2006) -eq 0) 'First-launch document must be empty.'
     foreach ($character in 'First-launch text'.ToCharArray()) {
-        [RstpadSmoke]::SendMessage((Control 101),0x102,[IntPtr][int]$character,[IntPtr]::Zero) | Out-Null
+        [RstpdSmoke]::SendMessage((Control 101),0x102,[IntPtr][int]$character,[IntPtr]::Zero) | Out-Null
     }
     Close-Editor
     $firstRecovery = Get-Content -LiteralPath $firstSession -Raw | ConvertFrom-Json
@@ -184,6 +187,19 @@ try {
     Assert ((Number (Control 101) 2006) -eq 'First-launch text'.Length) 'No-argument relaunch lost recovered text.'
     Close-Editor
 
+    New-Item -ItemType Directory -Force $legacySessionDirectory | Out-Null
+    foreach ($name in @('session.json','session.lock')) {
+        Move-Item -LiteralPath (Join-Path $firstSessionDirectory $name) -Destination (Join-Path $legacySessionDirectory $name)
+    }
+    Remove-Item -LiteralPath $firstSessionDirectory
+    Start-Editor $false $true
+    Assert ((Number (Control 101) 2006) -eq 'First-launch text'.Length) 'Renamed app did not restore legacy recovery data.'
+    Close-Editor
+    Assert (!(Test-Path -LiteralPath $firstSession)) 'Legacy recovery was unexpectedly moved or replaced.'
+    $legacyRecovery = Get-Content -LiteralPath $legacySession -Raw | ConvertFrom-Json
+    Assert ($legacyRecovery.documents[0].text -eq 'First-launch text') 'Legacy recovery contents changed during the rename.'
+
+    New-Item -ItemType Directory -Force $firstSessionDirectory | Out-Null
     @{ version = 1; documents = @(); active = 0; theme = 'system' } |
         ConvertTo-Json | Set-Content -LiteralPath $firstSession -Encoding utf8
     Start-Editor $false $true
@@ -200,15 +216,15 @@ try {
         @{ Id=1082; Name='JSON tree' },@{ Id=1051; Name='Document map' }
     )) {
         Assert ((Caption (Control $button.Id)) -eq $button.Name) 'An icon button lost its accessible name.'
-        $rect=[RstpadSmoke+Rect]::new()
-        [RstpadSmoke]::GetWindowRect((Control $button.Id),[ref]$rect) | Out-Null
+        $rect=[RstpdSmoke+Rect]::new()
+        [RstpdSmoke]::GetWindowRect((Control $button.Id),[ref]$rect) | Out-Null
         Assert ([Math]::Abs(($rect.right-$rect.left)-($rect.bottom-$rect.top)) -le 1) 'Toolbar buttons are not compact squares.'
     }
-    $mnemonic = [RstpadSmoke]::SendMessage($script:window,0x120,[IntPtr][int][char]'f',[RstpadSmoke]::GetMenu($script:window)).ToInt64()
+    $mnemonic = [RstpdSmoke]::SendMessage($script:window,0x120,[IntPtr][int][char]'f',[RstpdSmoke]::GetMenu($script:window)).ToInt64()
     Assert (($mnemonic -shr 16) -eq 2) 'Native menu keyboard mnemonic is not working.'
     Command 1070
     Start-Sleep -Milliseconds 700
-    Assert ([RstpadSmoke]::IsWindowVisible((Control 102))) 'Compare did not open the second pane.'
+    Assert ([RstpdSmoke]::IsWindowVisible((Control 102))) 'Compare did not open the second pane.'
     Assert ((Caption (Control 303)) -match 'Difference|difference') 'Compare did not finish.'
     Assert ((Number (Control 101) 2046 2) -ne 0) 'Compare did not mark a changed line.'
     $beforeLength = Number (Control 101) 2006
@@ -226,18 +242,18 @@ try {
     Command 1082
     Wait-Until { (Number (Control 301) 0x1105) -gt 5 } 'JSON tree has no nodes.'
     Command 1051
-    Assert ([RstpadSmoke]::IsWindowVisible((Control 104))) 'Document map did not open.'
+    Assert ([RstpdSmoke]::IsWindowVisible((Control 104))) 'Document map did not open.'
     Command 1040
-    [RstpadSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'value') | Out-Null
-    [RstpadSmoke]::SendMessage((Control 402),0x0c,[IntPtr]::Zero,'score') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'value') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 402),0x0c,[IntPtr]::Zero,'score') | Out-Null
     Command 1044
     Number (Control 403) 0x14e 2 | Out-Null
-    [RstpadSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'(?<=")(?P<key>score)(?=")') | Out-Null
-    [RstpadSmoke]::SendMessage((Control 402),0x0c,[IntPtr]::Zero,'${key}_regex') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'(?<=")(?P<key>score)(?=")') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 402),0x0c,[IntPtr]::Zero,'${key}_regex') | Out-Null
     Command 1044
     Number (Control 403) 0x14e 1 | Out-Null
-    [RstpadSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'\x73core_regex') | Out-Null
-    [RstpadSmoke]::SendMessage((Control 402),0x0c,[IntPtr]::Zero,'score') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'\x73core_regex') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 402),0x0c,[IntPtr]::Zero,'score') | Out-Null
     Command 1044
     Wait-Until { (Caption (Control 303)) -match 'Live JSON tree' } 'JSON tree did not refresh automatically.'
     $treeRoot = Number (Control 301) 0x110a 0
@@ -260,7 +276,7 @@ try {
     Assert (!$savedText.Contains("`r")) 'LF conversion failed.'
     Command 1001
     foreach ($character in 'Recovered untitled'.ToCharArray()) {
-        [RstpadSmoke]::SendMessage((Control 101),0x102,[IntPtr][int]$character,[IntPtr]::Zero) | Out-Null
+        [RstpdSmoke]::SendMessage((Control 101),0x102,[IntPtr][int]$character,[IntPtr]::Zero) | Out-Null
     }
     Start-Sleep -Milliseconds 4000
     $session = Get-Content (Join-Path $directory 'session.json') -Raw | ConvertFrom-Json
@@ -326,11 +342,11 @@ try {
     Wait-Until { (Number (Control 101) 2010 $liveOffset) -eq 2 } 'Restored Markdown document lost its highlighting.'
     Command 2000
     Assert ((Caption (Control 303)) -match '\|\s+Plain text\s+\|') 'Top-level Plain text command selected the wrong language.'
-    $languageMenu=[RstpadSmoke]::GetSubMenu([RstpadSmoke]::GetMenu($script:window),5)
-    $middle=[RstpadSmoke]::GetSubMenu($languageMenu,6)
+    $languageMenu=[RstpdSmoke]::GetSubMenu([RstpdSmoke]::GetMenu($script:window),5)
+    $middle=[RstpdSmoke]::GetSubMenu($languageMenu,6)
     $foundMarkdown=$false
-    for ($item=0; $item -lt [RstpadSmoke]::GetMenuItemCount($middle); $item++) {
-        Command ([RstpadSmoke]::GetMenuItemID($middle,$item))
+    for ($item=0; $item -lt [RstpdSmoke]::GetMenuItemCount($middle); $item++) {
+        Command ([RstpdSmoke]::GetMenuItemID($middle,$item))
         if ((Caption (Control 303)) -match '\|\s+Markdown\s+\|') { $foundMarkdown=$true; break }
     }
     Assert $foundMarkdown 'Markdown is not selectable from the M-O language group.'
@@ -343,13 +359,13 @@ try {
         Stop-Process -Id $script:process.Id
         $script:process.WaitForExit()
     }
-    foreach ($sessionDirectory in @($firstSessionDirectory,$directory)) {
+    foreach ($sessionDirectory in @($firstSessionDirectory,$legacySessionDirectory,$directory)) {
         foreach ($name in @('session.json','session.lock','before.json','after.json','custom-language.xml','sample.rstlang','completion-api.xml','functions.rs','highlighting.md')) {
             $path = Join-Path $sessionDirectory $name
             if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
         }
     }
-    foreach ($path in @($firstSessionDirectory,$firstProfile,$directory)) {
+    foreach ($path in @($firstSessionDirectory,$legacySessionDirectory,$firstProfile,$directory)) {
         if ((Test-Path -LiteralPath $path) -and !(Get-ChildItem -LiteralPath $path -Force)) {
             Remove-Item -LiteralPath $path
         }

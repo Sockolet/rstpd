@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use rstpad::{
+use rstpd::{
     editor::{self, Editor, Palette, sci::*},
     languages,
 };
@@ -106,7 +106,7 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
         assert_ne!(left.send(SCI_CALLTIPACTIVE, 0, 0), 0);
         left.send(SCI_CALLTIPCANCEL, 0, 0);
 
-        let definition = rstpad::udl::import(include_str!("fixtures\\custom-language.xml"))
+        let definition = rstpd::udl::import(include_str!("fixtures\\custom-language.xml"))
             .unwrap()
             .remove(0);
         let mut custom_catalog = languages::catalog(&available);
@@ -115,7 +115,7 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
             .unwrap();
         let text = include_str!("fixtures\\sample.rstlang");
         left.set_text(text).unwrap();
-        left.highlight(&rstpad::udl::highlight(&definition, text).unwrap())
+        left.highlight(&rstpd::udl::highlight(&definition, text).unwrap())
             .unwrap();
         assert_eq!(left.send(SCI_GETSTYLEAT, text.find("say").unwrap(), 0), 4);
         assert_ne!(left.send(SCI_GETFOLDLEVEL, 0, 0) & 0x2000, 0);

@@ -1,5 +1,5 @@
 {
-  "application": "RSTPad",
+  "application": "rstpd",
   "theme": "dark",
   "value": 84,
   "features": ["tabs", "syntax", "recovery", "compare"],

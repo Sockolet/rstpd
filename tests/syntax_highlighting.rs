@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use rstpad::{
+use rstpd::{
     editor::{self, Editor, Palette, sci::*},
     languages,
 };
@@ -83,7 +83,7 @@ fn markdown_has_visible_syntax_in_both_themes() {
             assert_ne!(
                 editor.send(
                     SCI_INDICATORVALUEAT,
-                    rstpad::markdown::STRIKE_INDICATOR,
+                    rstpd::markdown::STRIKE_INDICATOR,
                     text.find("removed words").unwrap() as isize
                 ),
                 0

@@ -211,7 +211,7 @@ fn sources(build: &mut cc::Build, directory: &str, exclude: &str) {
 
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        panic!("RSTPad requires Windows and the MSVC toolchain.");
+        panic!("rstpd requires Windows and the MSVC toolchain.");
     }
     language_data();
     let header = fs::read_to_string("vendor/scintilla/include/Scintilla.h")

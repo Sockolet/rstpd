@@ -10,6 +10,25 @@ use std::{
 
 pub const SESSION_VERSION: u32 = 2;
 
+pub fn default_directory(local_app_data: &Path) -> Result<PathBuf> {
+    let current = local_app_data.join("rstpd");
+    let legacy = local_app_data.join("RSTPad");
+    for directory in [&current, &legacy] {
+        for name in ["session.json", "session.lock"] {
+            let path = directory.join(name);
+            if path.try_exists().map_err(|error| {
+                format!(
+                    "Could not inspect recovery state {}: {error}",
+                    path.display()
+                )
+            })? {
+                return Ok(directory.clone());
+            }
+        }
+    }
+    Ok(current)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DocumentSnapshot {
     pub id: u64,
@@ -61,7 +80,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or("Destination has no parent directory.")?;
     let tmp = parent.join(format!(
-        ".rstpad-{}-{}.tmp",
+        ".rstpd-{}-{}.tmp",
         std::process::id(),
         TEMP_ID.fetch_add(1, Ordering::Relaxed)
     ));
@@ -230,9 +249,44 @@ impl Drop for RecoveryWorker {
 mod tests {
     use super::*;
     #[test]
+    fn renamed_app_preserves_legacy_recovery_and_lock_locations() {
+        let root = std::env::temp_dir().join(format!(
+            "rstpd-rename-test-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let current = root.join("rstpd");
+        let legacy = root.join("RSTPad");
+        assert_eq!(default_directory(&root).unwrap(), current);
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("session.lock"), b"").unwrap();
+        assert_eq!(default_directory(&root).unwrap(), legacy);
+        fs::create_dir(&current).unwrap();
+        assert_eq!(default_directory(&root).unwrap(), legacy);
+        fs::write(legacy.join("session.json"), b"legacy recovery").unwrap();
+        assert_eq!(default_directory(&root).unwrap(), legacy);
+        fs::write(current.join("session.json"), b"current recovery").unwrap();
+        assert_eq!(default_directory(&root).unwrap(), current);
+        assert_eq!(
+            fs::read(legacy.join("session.json")).unwrap(),
+            b"legacy recovery"
+        );
+        for file in [
+            current.join("session.json"),
+            legacy.join("session.json"),
+            legacy.join("session.lock"),
+        ] {
+            fs::remove_file(file).unwrap();
+        }
+        fs::remove_dir(current).unwrap();
+        fs::remove_dir(legacy).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
     fn atomic_session_round_trip_and_replace() {
         let dir = std::env::temp_dir().join(format!(
-            "rstpad-test-{}-{}",
+            "rstpd-test-{}-{}",
             std::process::id(),
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));

@@ -317,8 +317,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rstpad"
-version = "0.2.3"
+name = "rstpd"
+version = "0.2.4"
 dependencies = [
  "cc",
  "embed-resource",

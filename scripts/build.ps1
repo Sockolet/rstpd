@@ -11,7 +11,7 @@ try {
         $env:PATH = "$cargoDirectory;$env:PATH"
     }
     & "$PSScriptRoot\bootstrap.ps1"
-    if (!(Test-Path 'assets\rstpad.ico')) { & "$PSScriptRoot\generate-icon.ps1" }
+    if (!(Test-Path 'assets\rstpd.ico')) { & "$PSScriptRoot\generate-icon.ps1" }
     cargo test --locked --tests --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
     cargo build --locked --release
@@ -19,11 +19,11 @@ try {
     $metadataText = cargo metadata --locked --offline --filter-platform x86_64-pc-windows-msvc --format-version 1
     if ($LASTEXITCODE -ne 0) { throw 'Could not collect dependency license metadata.' }
     $metadata = $metadataText | ConvertFrom-Json
-    $version = ($metadata.packages | Where-Object { $_.name -eq 'rstpad' }).version
-    $packageName = "RSTPad-$version"
+    $version = ($metadata.packages | Where-Object { $_.name -eq 'rstpd' }).version
+    $packageName = "rstpd-$version"
     $package = Join-Path $root "dist\$packageName"
     New-Item -ItemType Directory -Force $package | Out-Null
-    Copy-Item 'target\release\rstpad.exe' $package
+    Copy-Item 'target\release\rstpd.exe' $package
     Copy-Item 'README.md','LICENSE','THIRD_PARTY_NOTICES.txt' $package
     $licenses = Join-Path $package 'licenses'
     New-Item -ItemType Directory -Force $licenses | Out-Null
@@ -55,7 +55,7 @@ try {
     }
     $dependencies = @()
     foreach ($dependency in $metadata.packages) {
-        if ($dependency.name -eq 'rstpad' -or !$reachable.Contains($dependency.id)) { continue }
+        if ($dependency.name -eq 'rstpd' -or !$reachable.Contains($dependency.id)) { continue }
         $dependencies += @{ name = $dependency.name; version = $dependency.version; license = $dependency.license }
         $source = Split-Path $dependency.manifest_path -Parent
         $notices = Get-ChildItem -LiteralPath $source -File | Where-Object { $_.Name -match '^(LICENSE|LICENCE|COPYING|COPYRIGHT|NOTICE|UNLICENSE)([.-]|$)' }
@@ -71,7 +71,7 @@ try {
     Compress-Archive -Path $package -DestinationPath $archive -Force
     $hash = (Get-FileHash $archive -Algorithm SHA256).Hash
     "$hash  $archiveName" | Set-Content "$archive.sha256" -Encoding ascii
-    Write-Host "Portable app: $package\rstpad.exe"
+    Write-Host "Portable app: $package\rstpd.exe"
     Write-Host "Distribution: $archive"
 } finally {
     $env:PATH = $originalPath

@@ -296,13 +296,13 @@ pub fn show_error(error: &str) {
         MessageBoxW(
             null_mut(),
             wide(error).as_ptr(),
-            wide("RSTPad").as_ptr(),
+            wide("rstpd").as_ptr(),
             MB_OK | MB_ICONERROR,
         );
     }
 }
 fn ask(hwnd: HWND, text: &str, flags: u32) -> i32 {
-    unsafe { MessageBoxW(hwnd, wide(text).as_ptr(), wide("RSTPad").as_ptr(), flags) }
+    unsafe { MessageBoxW(hwnd, wide(text).as_ptr(), wide("rstpd").as_ptr(), flags) }
 }
 
 #[repr(C)]
@@ -1739,7 +1739,7 @@ impl App {
         set_text(
             self.hwnd,
             &format!(
-                "{}{} - RSTPad",
+                "{}{} - rstpd",
                 doc.snapshot.title,
                 if doc.snapshot.dirty { " *" } else { "" }
             ),
@@ -1915,7 +1915,7 @@ impl App {
             if current != self.documents[index].snapshot.disk_hash
                 && ask(
                     self.hwnd,
-                    "The file changed or was deleted outside RSTPad. Overwrite the external version?",
+                    "The file changed or was deleted outside rstpd. Overwrite the external version?",
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
                 ) != IDYES
             {
@@ -2715,9 +2715,9 @@ impl App {
                 ask(
                     self.hwnd,
                     concat!(
-                        "RSTPad ",
+                        "rstpd ",
                         env!("CARGO_PKG_VERSION"),
-                        "\nRust application with statically linked Scintilla + Lexilla.\nNo plugin loader, script execution, network service, or automatic updater.\n\nAlt+drag: rectangular selection\nCtrl+click: multiple carets\nCtrl+D / Ctrl+Shift+L: next / all occurrences\nF6: focus other pane; Ctrl+Tab: next tab\nCtrl+Space: contextual completion\nCtrl+Shift+Space: function parameter hint\nCtrl+mouse wheel: zoom\nCtrl+Alt+J: format JSON/JSON5; Ctrl+Alt+T: live JSON tree\nF7 / Shift+F7: next / previous difference\n\nCompare and JSON refresh automatically after edits.\nLanguage menu: import data-only language/API XML.\nUnsaved tabs recover when the app reopens. Close the app to keep them.\nRecovery is local plaintext in %LOCALAPPDATA%\\RSTPad.\nRegex supports look-around/backreferences ($1 or ${name} replacements).\nFiles: 128 MiB; search, line and JSON tools: 16 MiB.\n\nIndependent application; not affiliated with Notepad++."
+                        "\nRust application with statically linked Scintilla + Lexilla.\nNo plugin loader, script execution, network service, or automatic updater.\n\nAlt+drag: rectangular selection\nCtrl+click: multiple carets\nCtrl+D / Ctrl+Shift+L: next / all occurrences\nF6: focus other pane; Ctrl+Tab: next tab\nCtrl+Space: contextual completion\nCtrl+Shift+Space: function parameter hint\nCtrl+mouse wheel: zoom\nCtrl+Alt+J: format JSON/JSON5; Ctrl+Alt+T: live JSON tree\nF7 / Shift+F7: next / previous difference\n\nCompare and JSON refresh automatically after edits.\nLanguage menu: import data-only language/API XML.\nUnsaved tabs recover when the app reopens. Close the app to keep them.\nRecovery is local plaintext; existing recovery folders are preserved.\nSee README for current and legacy recovery locations.\nRegex supports look-around/backreferences ($1 or ${name} replacements).\nFiles: 128 MiB; search, line and JSON tools: 16 MiB.\n\nIndependent application; not affiliated with Notepad++."
                     ),
                     MB_OK | MB_ICONINFORMATION,
                 );
@@ -3211,12 +3211,14 @@ pub fn run() -> Result<()> {
                 paths.push(PathBuf::from(arg));
             }
         }
-        let directory = session_dir.unwrap_or(
-            std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .ok_or("LOCALAPPDATA is unavailable.")?
-                .join("RSTPad"),
-        );
+        let directory = match session_dir {
+            Some(directory) => directory,
+            None => session::default_directory(
+                &std::env::var_os("LOCALAPPDATA")
+                    .map(PathBuf::from)
+                    .ok_or("LOCALAPPDATA is unavailable.")?,
+            )?,
+        };
         fs::create_dir_all(&directory)
             .map_err(|e| format!("Could not create recovery directory: {e}"))?;
         let lock = OpenOptions::new()
@@ -3227,12 +3229,12 @@ pub fn run() -> Result<()> {
             .open(directory.join("session.lock"))
             .map_err(|e| {
                 format!(
-                    "Cannot lock the session. Another RSTPad instance may already be running: {e}"
+                    "Cannot lock the session. Another rstpd instance may already be running: {e}"
                 )
             })?;
         let recovery_path = directory.join("session.json");
         let session = session::load(&recovery_path)?;
-        let class = wide("RSTPad.Window");
+        let class = wide("rstpd.Window");
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
@@ -3250,7 +3252,7 @@ pub fn run() -> Result<()> {
         let hwnd = CreateWindowExW(
             WS_EX_ACCEPTFILES,
             class.as_ptr(),
-            wide("RSTPad").as_ptr(),
+            wide("rstpd").as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
