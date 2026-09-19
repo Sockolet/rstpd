@@ -1,0 +1,73 @@
+RSTPad third-party notices
+=========================
+
+RSTPad application code is licensed under the MIT License (see LICENSE).
+
+Statically linked editor components:
+  Scintilla 5.6.6 - source: www.scintilla.org/scintilla566.zip
+  Lexilla 5.5.3 - source: www.scintilla.org/lexilla553.zip
+
+Build-time keyword/style data:
+  SciTE 5.6.6 properties - source: www.scintilla.org/scite566.zip
+  Lexilla lexer metadata and keyword examples from its source distribution
+
+Only editor component sources and language data are used. No Notepad++
+application code, plugin code, or SciTE application code is incorporated.
+The source archives retain their original per-file notices.
+
+assets\language-coverage.tsv records factual language names and file extensions
+from the Notepad++ language inventory (model date 20260714). It does not
+incorporate Notepad++ lexer or application implementations.
+
+Pinned SHA-256 hashes:
+  scintilla566.zip
+  A0C0CDF1CF226DC6252020CE9A87A939A8B615E65269DB40AC9123B28FA20A9D
+  lexilla553.zip
+  2092B1DD18355321717E3BDE25148E4C87E691723CA2B06A65E29A307C5462A6
+  scite566.zip
+  84D7DBE9D9CEB34961AD6FBDCF91A24F7CC1A2FD59D1851C0F5F4A0CDBFDE2F9
+
+These hashes pin the downloaded bytes; they are not code signatures or an
+independent security certification.
+
+License for Lexilla, Scintilla, and SciTE
+---------------------------------------
+Copyright 1998-2021 by Neil Hodgson <neilh@scintilla.org>
+
+All Rights Reserved
+
+Permission to use, copy, modify, and distribute this software and its
+documentation for any purpose and without fee is hereby granted,
+provided that the above copyright notice appear in all copies and that
+both that copyright notice and this permission notice appear in
+supporting documentation.
+
+NEIL HODGSON DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS, IN NO EVENT SHALL NEIL HODGSON BE LIABLE FOR ANY
+SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE
+OR PERFORMANCE OF THIS SOFTWARE.
+
+Rust dependencies
+-----------------
+The exact versions and registry checksums are recorded in Cargo.lock.
+scripts\build.ps1 copies dependency redistribution notices into the portable
+package's licenses directory, along with dependencies.json (name, version,
+and declared SPDX license). This includes build-time dependencies for
+completeness; not all packages in that inventory are part of the runtime.
+
+Toolbar icons
+-------------
+The eight toolbar icons are native-vector adaptations of Lucide artwork,
+pinned to revision 951813ce76a859d4d8b145366972cbb237147a4e.
+Lucide is distributed under ISC, with an additional MIT notice for its
+Feather-derived subset. The complete notices and individual icon provenance
+are in assets\icons in the source tree and licenses\lucide-icons in the
+portable package.
+
+Rust itself is distributed under the MIT and Apache-2.0 licenses. Windows
+system libraries and the Microsoft C/C++ runtime are subject to their
+respective Microsoft licenses.

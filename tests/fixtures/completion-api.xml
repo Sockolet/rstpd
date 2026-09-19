@@ -1,0 +1,10 @@
+<NotepadPlus>
+  <AutoComplete>
+    <KeyWord name="lookup_record" func="yes">
+      <Overload retVal="Record">
+        <Param name="key"/>
+        <Param name="fallback = None"/>
+      </Overload>
+    </KeyWord>
+  </AutoComplete>
+</NotepadPlus>

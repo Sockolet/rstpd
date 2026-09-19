@@ -1,0 +1,97 @@
+# Language/extension inventory facts checked against langs.model.xml modelDate 20260714 on 2026-09-19.
+# upstream name|RSTPad mode|extensions
+# searchResult is an internal result-pane format, not a source-file language.
+normal|Plain text|txt
+actionscript|ActionScript|as mx
+ada|Ada|ada ads adb
+asm|Assembly|asm
+asn1|ASN.1|mib
+asp|ASP|asp aspx
+autoit|AutoIt|au3
+avs|AviSynth|avs avsi
+baanc|BaanC|bc cln
+bash|Bash|bash sh bsh csh bash_profile bashrc profile
+batch|Batch|bat cmd nt
+blitzbasic|BlitzBasic|bb
+c|C|c lex
+caml|Caml / OCaml|ml mli sml thy
+cmake|CMake|cmake
+cobol|COBOL|cbl cbd cdb cdc cob cpy copy lst
+csound|Csound|orc sco csd
+coffeescript|CoffeeScript|coffee litcoffee
+cpp|C++|cpp cxx cc h hh hpp hxx ino
+cs|C#|cs
+css|CSS|css
+d|D|d
+diff|Diff|diff patch
+erlang|Erlang|erl hrl
+errorlist|Error list|err
+escseq|ANSI escape sequences|ans
+escript|EScript|src em
+forth|Forth|forth
+fortran|Fortran|f for f90 f95 f2k f23
+fortran77|Fortran 77|f77
+freebasic|FreeBasic|bas bi
+go|Go|go
+gui4cli|Gui4Cli|gui
+haskell|Haskell|hs lhs las
+hollywood|Hollywood|hws
+html|HTML|html htm shtml shtm xhtml xht hta
+ini|INI|ini inf url wer
+inno|Inno Setup|iss
+ihex|Intel HEX|hex
+java|Java|java
+javascript|JavaScript|
+javascript.js|JavaScript|js jsm jsx mjs vue
+json|JSON|json
+json5|JSON5 / JSONC|json5 jsonc
+jsp|JSP|jsp
+kix|KiXtart|kix
+lisp|LISP|lsp lisp
+latex|LaTeX|tex sty
+lua|Lua|lua
+makefile|Makefile|mak mk
+matlab|MATLAB|m
+mssql|MS SQL|tsql
+mmixal|MMIXAL|mms
+nim|Nim|nim
+nncrontab|nnCron|tab spf
+nfo|MS-DOS Style|nfo
+nsis|NSIS|nsi nsh
+oscript|OScript|osx
+objc|Objective-C|mm
+pascal|Pascal|pas pp p inc lpr dpr
+perl|Perl|pl pm plx t
+php|PHP|php php3 php4 php5 phps phpt phtml
+postscript|PostScript|ps
+powershell|PowerShell|ps1 psm1 psd1
+props|Properties|properties conf cf cfg gitattributes gitconfig gitmodules editorconfig
+purebasic|PureBasic|pb
+python|Python|py pyw pyx pxd pxi pyi
+gdscript|GDScript|gd
+r|R|r s splus
+raku|Raku|raku rakumod rakudoc rakutest p6 pm6 pod6 t6
+rebol|REBOL|r2 r3 reb
+registry|Registry|reg
+rc|Resource|rc
+ruby|Ruby|rb rbw
+rust|Rust|rs
+sas|SAS|sas
+scheme|Scheme|scm smd ss
+smalltalk|Smalltalk|st
+spice|Spice|scp out
+sql|SQL|sql
+srec|S-Record|mot srec
+swift|Swift|swift
+tcl|Tcl|tcl itcl
+tehex|TEHex|tek
+tex|TeX|tex
+toml|TOML|toml
+vb|VB / Visual Basic|vb vba vbs
+txt2tags|txt2tags|t2t
+typescript|TypeScript|ts tsx
+verilog|Verilog / SystemVerilog|v sv vh svh
+vhdl|VHDL|vhd vhdl
+visualprolog|Visual Prolog|pro cl i pack ph
+xml|XML|xml xaml xsl xslt xsd xul kml svg mxml xsml wsdl xlf xliff xbl sxbl sitemap gml gpx plist slnx targets vcproj vcxproj csproj csxproj vbproj dbproj dproj wxs wixproj ilproj
+yaml|YAML|yml yaml

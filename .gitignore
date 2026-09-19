@@ -1,0 +1,6 @@
+/target/
+/dist/
+/vendor/scintilla/
+/vendor/lexilla/
+/vendor/language-data/
+*.pdb

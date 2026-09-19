@@ -1,0 +1,7 @@
+{
+  "application": "RSTPad",
+  "theme": "dark",
+  "value": 84,
+  "features": ["tabs", "syntax", "recovery", "compare"],
+  "plugins": false
+}

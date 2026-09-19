@@ -1,0 +1,7 @@
+{
+  "application": "RSTPad",
+  "theme": "system",
+  "value": 42,
+  "features": ["tabs", "syntax", "recovery"],
+  "plugins": false
+}

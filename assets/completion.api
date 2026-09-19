@@ -1,0 +1,139 @@
+rust||println!(format, args...)
+rust||format!(format, args...) -> String
+rust|string|len() -> usize
+rust|string|is_empty() -> bool
+rust|string|contains(pattern: &str) -> bool
+rust|string|starts_with(prefix: &str) -> bool
+rust|string|ends_with(suffix: &str) -> bool
+rust|string|trim() -> &str
+rust|string|split(pattern: &str) -> iterator
+rust|string|replace(from: &str, to: &str) -> String
+rust|string|push_str(value: &str)
+rust|string|to_uppercase() -> String
+rust|string|to_lowercase() -> String
+rust|array|push(value: T)
+rust|array|pop() -> Option<T>
+rust|array|len() -> usize
+rust|array|is_empty() -> bool
+rust|array|get(index: usize) -> Option<&T>
+rust|array|iter() -> iterator
+rust|array|sort()
+python||print(*objects, sep=' ', end='\n', file=None, flush=False)
+python||len(object) -> int
+python||range(start, stop, step=1)
+python||open(file, mode='r', encoding=None)
+python||enumerate(iterable, start=0)
+python|string|split(sep=None, maxsplit=-1) -> list
+python|string|replace(old, new, count=-1) -> str
+python|string|strip(chars=None) -> str
+python|string|lower() -> str
+python|string|upper() -> str
+python|string|startswith(prefix, start=0, end=None) -> bool
+python|string|endswith(suffix, start=0, end=None) -> bool
+python|string|join(iterable) -> str
+python|array|append(object)
+python|array|extend(iterable)
+python|array|insert(index, object)
+python|array|pop(index=-1)
+python|array|sort(key=None, reverse=False)
+python|array|reverse()
+python|map|get(key, default=None)
+python|map|items()
+python|map|keys()
+python|map|values()
+python|map|update(other)
+python|json|loads(text)
+python|json|dumps(object, indent=None)
+python|math|sqrt(x)
+python|math|floor(x)
+python|math|ceil(x)
+javascript||parseInt(text, radix=10)
+javascript||parseFloat(text)
+javascript||setTimeout(callback, delay, args...)
+javascript|string|includes(searchString, position=0) -> boolean
+javascript|string|slice(start, end) -> string
+javascript|string|substring(start, end) -> string
+javascript|string|split(separator, limit) -> array
+javascript|string|replace(pattern, replacement) -> string
+javascript|string|trim() -> string
+javascript|string|toLowerCase() -> string
+javascript|string|toUpperCase() -> string
+javascript|array|push(items...) -> number
+javascript|array|pop()
+javascript|array|map(callback, thisArg) -> array
+javascript|array|filter(callback, thisArg) -> array
+javascript|array|reduce(callback, initialValue)
+javascript|array|find(predicate, thisArg)
+javascript|array|forEach(callback, thisArg)
+javascript|array|slice(start, end) -> array
+javascript|console|log(values...)
+javascript|console|error(values...)
+javascript|console|warn(values...)
+javascript|JSON|parse(text, reviver)
+javascript|JSON|stringify(value, replacer, space)
+javascript|Math|max(values...)
+javascript|Math|min(values...)
+javascript|Math|round(value)
+cpp||printf(format, arguments...) -> int
+cpp|string|size() -> size_t
+cpp|string|empty() -> bool
+cpp|string|substr(position=0, count=npos) -> string
+cpp|string|find(text, position=0) -> size_t
+cpp|string|append(text)
+cpp|string|clear()
+cpp|array|push_back(value)
+cpp|array|pop_back()
+cpp|array|size() -> size_t
+cpp|array|at(index)
+cpp|array|reserve(capacity)
+cpp|std|move(value)
+cpp|std|sort(first, last, comparator)
+c||printf(format, arguments...) -> int
+c||snprintf(buffer, size, format, arguments...) -> int
+c||strlen(text) -> size_t
+c||strcmp(left, right) -> int
+csharp|string|Contains(value) -> bool
+csharp|string|StartsWith(value) -> bool
+csharp|string|EndsWith(value) -> bool
+csharp|string|Substring(startIndex, length) -> string
+csharp|string|Replace(oldValue, newValue) -> string
+csharp|string|Trim() -> string
+csharp|string|ToUpper() -> string
+csharp|string|ToLower() -> string
+csharp|array|Add(item)
+csharp|array|Remove(item) -> bool
+csharp|array|Clear()
+csharp|Console|WriteLine(value)
+java|string|length() -> int
+java|string|substring(beginIndex, endIndex) -> String
+java|string|contains(sequence) -> boolean
+java|string|replace(target, replacement) -> String
+java|string|trim() -> String
+java|string|toUpperCase() -> String
+java|string|toLowerCase() -> String
+java|array|add(element) -> boolean
+java|array|get(index)
+java|array|size() -> int
+go||len(value) -> int
+go||append(slice, elements...) -> slice
+go|fmt|Printf(format, args...) -> (int, error)
+go|fmt|Println(args...) -> (int, error)
+go|strings|Contains(text, substring) -> bool
+go|strings|Split(text, separator) -> []string
+lua||print(values...)
+lua||pairs(table) -> iterator
+lua|string|sub(start, end) -> string
+lua|string|find(pattern, init=1, plain=false)
+lua|table|insert(list, position, value)
+php||strlen(string) -> int
+php||str_replace(search, replace, subject)
+php||json_encode(value, flags=0, depth=512)
+php||json_decode(json, associative=false, depth=512, flags=0)
+ruby||puts(objects...)
+ruby|string|split(pattern, limit) -> array
+ruby|string|gsub(pattern, replacement) -> string
+ruby|string|upcase() -> string
+ruby|string|downcase() -> string
+sql||COUNT(expression)
+sql||SUM(expression)
+sql||COALESCE(expression, fallback)

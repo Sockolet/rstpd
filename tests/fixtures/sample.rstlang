@@ -1,0 +1,4 @@
+begin
+say "hello"
+42
+end

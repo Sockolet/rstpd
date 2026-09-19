@@ -1,0 +1,20 @@
+<NotepadPlus>
+  <UserLang name="Example data language" ext="rstlang" udlVersion="2.1">
+    <Settings>
+      <Global caseIgnored="yes" forcePureLC="0" decimalSeparator="0" allowFoldOfComments="yes"/>
+      <Prefix Keywords1="no"/>
+    </Settings>
+    <KeywordLists>
+      <Keywords name="Comments">00// 01\ 02((EOL)) 03/* 04*/</Keywords>
+      <Keywords name="Keywords1">say let return</Keywords>
+      <Keywords name="Operators1">+ - =</Keywords>
+      <Keywords name="Folders in code1, open">begin</Keywords>
+      <Keywords name="Folders in code1, close">end</Keywords>
+      <Keywords name="Delimiters">00&quot; 01\ 02&quot;</Keywords>
+    </KeywordLists>
+    <Styles>
+      <WordsStyle name="KEYWORDS1" fgColor="0066CC" colorStyle="1" fontStyle="1"/>
+      <WordsStyle name="DELIMITERS1" fgColor="AA5500" colorStyle="1" nesting="0"/>
+    </Styles>
+  </UserLang>
+</NotepadPlus>

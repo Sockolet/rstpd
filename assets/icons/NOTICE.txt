@@ -1,0 +1,18 @@
+Toolbar artwork: Lucide Icons
+Source revision: 951813ce76a859d4d8b145366972cbb237147a4e
+Source repository: https://github.com/lucide-icons/lucide
+
+Native vector geometry in src\toolbar.rs is adapted from these 24px icons:
+  New: file-plus-corner
+  Open: folder-open
+  Save: save
+  Find: search
+  Split: columns-2
+  Compare: diff
+  JSON tree: list-tree
+  Document map: panel-right
+
+Source files are under icons/<name>.svg at the pinned revision.
+Curves are adapted to native GDI paths and supersampled for smooth DPI scaling.
+No icon font, browser, SVG runtime, or external resource loader is required.
+See LICENSE.txt for Lucide's ISC license and the Feather-derived MIT notice.

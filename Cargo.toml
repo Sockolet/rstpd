@@ -1,0 +1,48 @@
+[package]
+name = "rstpad"
+version = "0.2.3"
+edition = "2024"
+rust-version = "1.98"
+description = "A small, native Windows text editor without plugins"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+encoding_rs = "0.8"
+fancy-regex = "0.19.2"
+regex = "1"
+roxmltree = "0.21"
+unicode-segmentation = "1"
+json5 = "0.4"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+similar = "2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }
+embed-resource = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
