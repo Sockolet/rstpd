@@ -1,5 +1,5 @@
 use crate::{
-    core::{MAX_DOCUMENT_BYTES, Result},
+    core::{EditorFont, MAX_DOCUMENT_BYTES, Result},
     languages::{self, Language},
     syntax::{self, Role},
 };
@@ -452,12 +452,20 @@ impl Editor {
         result
     }
     pub fn language(self, language: &Language, palette: Palette) -> Result<()> {
+        self.language_with_font(language, palette, &EditorFont::default())
+    }
+    pub fn language_with_font(
+        self,
+        language: &Language,
+        palette: Palette,
+        font: &EditorFont,
+    ) -> Result<()> {
         self.clear_indicator(crate::markdown::STRIKE_INDICATOR);
         if language.uses_container() {
             unsafe {
                 self.send_raw(SCI_SETILEXER, 0, 0);
             }
-            self.theme(language, palette);
+            self.theme_with_font(language, palette, font);
             return Ok(());
         }
         let name = CString::new(language.lexer.as_str()).map_err(|e| e.to_string())?;
@@ -527,7 +535,7 @@ impl Editor {
                 "0"
             },
         );
-        self.theme(language, palette);
+        self.theme_with_font(language, palette, font);
         Ok(())
     }
     fn property(self, name: &str, value: &str) {
@@ -542,6 +550,9 @@ impl Editor {
         }
     }
     pub fn theme(self, language: &Language, palette: Palette) {
+        self.theme_with_font(language, palette, &EditorFont::default());
+    }
+    pub fn theme_with_font(self, language: &Language, palette: Palette, font: &EditorFont) {
         self.send(SCI_STYLESETFORE, 32, palette.text as isize);
         self.send(SCI_STYLESETBACK, 32, palette.background as isize);
         self.send(SCI_STYLESETBOLD, 32, 0);
@@ -552,17 +563,18 @@ impl Editor {
             .custom
             .as_ref()
             .and_then(|custom| custom.styles[0].font.as_deref())
-            .unwrap_or("Consolas");
-        let font = CString::new(default_font).expect("validated font family");
+            .unwrap_or(font.family());
+        let family = CString::new(default_font).expect("validated font family");
         unsafe {
-            self.send_raw(SCI_STYLESETFONT, 32, font.as_ptr() as isize);
+            self.send_raw(SCI_STYLESETFONT, 32, family.as_ptr() as isize);
         }
         let size = language
             .custom
             .as_ref()
             .and_then(|custom| custom.styles[0].font_size)
-            .unwrap_or(11);
-        self.send(SCI_STYLESETSIZEFRACTIONAL, 32, size as isize * 100);
+            .map(|size| u32::from(size) * 100)
+            .unwrap_or(font.size_hundredths());
+        self.send(SCI_STYLESETSIZEFRACTIONAL, 32, size as isize);
         self.send(SCI_STYLECLEARALL, 0, 0);
         let count = self.send(SCI_GETNAMEDSTYLES, 0, 0).clamp(0, 256) as usize;
         let base_styles = if language.lexer == "markdown" {
@@ -710,6 +722,16 @@ impl Editor {
             }
         }
         self.send(SCI_COLOURISE, 0, -1);
+        self.update_line_number_margin();
+    }
+    pub fn update_line_number_margin(self) {
+        let digits = self.send(SCI_GETLINECOUNT, 0, 0).to_string().len().max(4);
+        let sample = CString::new("9".repeat(digits)).expect("line-number digits");
+        let measured = unsafe { self.send_raw(SCI_TEXTWIDTH, 33, sample.as_ptr() as isize) };
+        let width = (measured + 12).max(52);
+        if self.send(SCI_GETMARGINWIDTHN, 0, 0) != width {
+            self.send(SCI_SETMARGINWIDTHN, 0, width);
+        }
     }
     fn context(self) -> Result<(usize, usize, String)> {
         let pos = self.position();

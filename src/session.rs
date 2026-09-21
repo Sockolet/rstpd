@@ -1,4 +1,4 @@
-use crate::core::{Encoding, Eol, MAX_DOCUMENT_BYTES, Result};
+use crate::core::{EditorFont, Encoding, Eol, MAX_DOCUMENT_BYTES, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -49,6 +49,8 @@ pub struct Session {
     pub documents: Vec<DocumentSnapshot>,
     pub active: usize,
     pub theme: String,
+    #[serde(default)]
+    pub editor_font: EditorFont,
     #[serde(default)]
     pub custom_languages: Vec<crate::udl::UserLanguage>,
     #[serde(default)]
@@ -248,6 +250,90 @@ impl Drop for RecoveryWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_font_preferences_round_trip_without_a_schema_bump() {
+        let dir = std::env::temp_dir().join(format!(
+            "rstpd-font-session-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.json");
+        assert_eq!(load(&path).unwrap().editor_font, EditorFont::default());
+        let session = Session {
+            version: SESSION_VERSION,
+            theme: "dark".into(),
+            editor_font: EditorFont::new("Example Sans", 1250).unwrap(),
+            ..Session::default()
+        };
+        save(&path, &session).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.version, 2);
+        assert_eq!(restored.editor_font, session.editor_font);
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            stored["editor_font"],
+            serde_json::json!({"family": "Example Sans", "size_hundredths": 1250})
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn old_sessions_default_the_font_without_rewriting_recovery() {
+        let dir = std::env::temp_dir().join(format!(
+            "rstpd-font-legacy-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.json");
+        for version in [1, 2] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "version": version, "documents": [], "active": 0, "theme": "system"
+            }))
+            .unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(load(&path).unwrap().editor_font, EditorFont::default());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_stored_fonts_fail_without_changing_recovery_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "rstpd-font-invalid-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.json");
+        for font in [
+            serde_json::json!({"family": " ", "size_hundredths": 1100}),
+            serde_json::json!({"family": "Consolas\u{0000}", "size_hundredths": 1100}),
+            serde_json::json!({"family": "a".repeat(129), "size_hundredths": 1100}),
+            serde_json::json!({"family": "Consolas", "size_hundredths": 399}),
+            serde_json::json!({"family": "Consolas", "size_hundredths": 7201}),
+            serde_json::Value::Null,
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "version": 2, "documents": [], "active": 0, "theme": "system",
+                "editor_font": font
+            }))
+            .unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let error = load(&path).unwrap_err();
+            assert!(error.contains("has not been changed"), "{error}");
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn renamed_app_preserves_legacy_recovery_and_lock_locations() {
         let root = std::env::temp_dir().join(format!(

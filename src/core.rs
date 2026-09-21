@@ -12,6 +12,74 @@ pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_TOOL_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EditorFontData")]
+pub struct EditorFont {
+    family: String,
+    size_hundredths: u32,
+}
+
+#[derive(Deserialize)]
+struct EditorFontData {
+    family: String,
+    size_hundredths: u32,
+}
+
+impl EditorFont {
+    pub const MIN_SIZE_HUNDREDTHS: u32 = 400;
+    pub const MAX_SIZE_HUNDREDTHS: u32 = 7200;
+
+    pub fn new(family: impl Into<String>, size_hundredths: u32) -> Result<Self> {
+        let family = family.into();
+        if family.trim().is_empty() {
+            return Err("Editor font family must not be empty or whitespace-only.".into());
+        }
+        if family.len() > 128 {
+            return Err("Editor font family must be at most 128 UTF-8 bytes.".into());
+        }
+        if family.chars().any(char::is_control) {
+            return Err("Editor font family must not contain control characters.".into());
+        }
+        if !(Self::MIN_SIZE_HUNDREDTHS..=Self::MAX_SIZE_HUNDREDTHS).contains(&size_hundredths) {
+            return Err("Editor font size must be between 4 and 72 points.".into());
+        }
+        Ok(Self {
+            family,
+            size_hundredths,
+        })
+    }
+
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn size_hundredths(&self) -> u32 {
+        self.size_hundredths
+    }
+}
+
+impl Default for EditorFont {
+    fn default() -> Self {
+        Self {
+            family: if cfg!(windows) {
+                "Consolas"
+            } else {
+                "Monospace"
+            }
+            .into(),
+            size_hundredths: 1100,
+        }
+    }
+}
+
+impl TryFrom<EditorFontData> for EditorFont {
+    type Error = String;
+
+    fn try_from(data: EditorFontData) -> Result<Self> {
+        Self::new(data.family, data.size_hundredths)
+    }
+}
+
 pub struct Highlight {
     pub styles: Vec<u8>,
     pub folds: Vec<usize>,
@@ -1412,5 +1480,67 @@ mod tests {
             .unwrap();
         assert_eq!(&text[value.span.clone()], "0xFF");
         assert!(nodes.iter().any(|node| node.pointer == "/list/1"));
+    }
+}
+
+#[cfg(test)]
+mod editor_font_tests {
+    use super::*;
+
+    #[test]
+    fn validates_family_bytes_and_fractional_point_sizes() {
+        let font = EditorFont::new("Example Sans", 1250).unwrap();
+        assert_eq!(font.family(), "Example Sans");
+        assert_eq!(font.size_hundredths(), 1250);
+        assert!(EditorFont::new("a".repeat(128), 400).is_ok());
+        assert!(EditorFont::new("\u{e9}".repeat(64), 7200).is_ok());
+        assert!(EditorFont::new("a".repeat(129), 1100).is_err());
+        assert!(EditorFont::new("\u{e9}".repeat(65), 1100).is_err());
+        for family in [
+            "",
+            " \t ",
+            "\u{2003}",
+            "Mono\0space",
+            "Mono\nspace",
+            "Mono\u{85}space",
+        ] {
+            assert!(EditorFont::new(family, 1100).is_err(), "{family:?}");
+        }
+        for size in [0, 399, 7201, u32::MAX] {
+            assert!(EditorFont::new("Consolas", size).is_err(), "{size}");
+        }
+    }
+
+    #[test]
+    fn preferences_have_a_shared_serialized_shape_and_platform_default() {
+        let font = EditorFont::new("Example Sans", 1250).unwrap();
+        let json = serde_json::to_string(&font).unwrap();
+        assert_eq!(json, r#"{"family":"Example Sans","size_hundredths":1250}"#);
+        assert_eq!(serde_json::from_str::<EditorFont>(&json).unwrap(), font);
+        let default = EditorFont::default();
+        assert_eq!(
+            default.family(),
+            if cfg!(windows) {
+                "Consolas"
+            } else {
+                "Monospace"
+            }
+        );
+        assert_eq!(default.size_hundredths(), 1100);
+    }
+
+    #[test]
+    fn deserialization_cannot_bypass_validation() {
+        for json in [
+            r#"{"family":"","size_hundredths":1100}"#,
+            r#"{"family":"\u0000","size_hundredths":1100}"#,
+            r#"{"family":"Consolas","size_hundredths":399}"#,
+            r#"{"family":"Consolas","size_hundredths":7201}"#,
+            r#"{"family":"Consolas","size_hundredths":-1}"#,
+            r#"{"family":"Consolas","size_hundredths":12.5}"#,
+            r#"{"family":"Consolas"}"#,
+        ] {
+            assert!(serde_json::from_str::<EditorFont>(json).is_err(), "{json}");
+        }
     }
 }

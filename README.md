@@ -32,14 +32,16 @@ does not forward filenames to the existing instance.
 
 Close an older rstpd instance before opening this release with the same session.
 Version 0.2 reads version-1 sessions and saves version-2 sessions, including
-language/completion definitions. Version 0.1 deliberately refuses version-2
-sessions rather than silently dropping the new settings.
+language/completion definitions and optional editor-font preferences.
+Version 0.1 deliberately refuses version-2 sessions rather than silently dropping
+the new settings.
 
 ## Features
 
 | Area | Implementation |
 |---|---|
 | Native UI | Windows title bar, menus, dialogs and controls; DPI-aware Segoe UI chrome, light/dark/system themes, closeable tabs and a compact Lucide icon toolbar |
+| Editor font | Native family/size selection, 4-72 pt, saved per workspace and shared by both editing panes and future tabs |
 | Highlighting | All 94 source-language inventory entries mapped, plus the full pinned Lexilla catalog; filename detection, mode selection, and data-only UDL 2.0/2.1 import |
 | Markdown | CommonMark/GFM parsing with visible headings, emphasis, links, lists, quotes, tasks, tables, inline/fenced/indented code and strikethrough |
 | Completion | Keywords, local declarations, member/context suggestions, common built-in APIs, parameter hints and importable completion signatures |
@@ -91,6 +93,26 @@ embedded language-specific token coloring inside code fences is not provided.
 Other lexers use semantic style names, metadata and bundled font attributes.
 Types, functions, properties, tags, strings and comments are no longer flattened
 into the same generic identifier color, including styles used by embedded markup.
+
+### Editor font and zoom
+
+Use **View > Editor font...** to select an installed scalable font family and
+size from **4 to 72 pt**. The chooser offers only family and size, not font style,
+color, underline or strikeout. Confirming applies the preference to both panes
+and future tabs and resets both panes' transient zoom to zero; **View > Reset
+zoom** subsequently returns to that chosen base size. Cancel changes neither
+the preference nor zoom. Document text, dirty state and undo history are not
+changed, and the Segoe UI font used by menus, tabs and other chrome is unchanged.
+
+The preference is saved in the current workspace's recovery session, including
+workspaces selected with `--session-dir`. Existing version-1/version-2 sessions
+without it use Consolas 11 pt. Invalid stored preferences are reported without
+rewriting recovery data. Theme/language changes and tab switches retain the
+choice. Syntax bold/italic/underline and colors are retained, as are explicit
+UDL font-family and size overrides; the document map stays compact at 2 pt.
+Line-number margins adjust to the font size, zoom and document line count.
+The Windows chooser reports names that cannot fit its 31-UTF-16-unit family
+field rather than truncating Unicode names.
 
 ## Language definitions and completion
 

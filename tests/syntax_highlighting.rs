@@ -1,5 +1,6 @@
 #![cfg(windows)]
 use rstpd::{
+    core::EditorFont,
     editor::{self, Editor, Palette, sci::*},
     languages,
 };
@@ -46,6 +47,7 @@ fn markdown_has_visible_syntax_in_both_themes() {
         editor.set_text(text).unwrap();
         for dark in [false, true] {
             editor.language(language, Palette::new(dark)).unwrap();
+            assert_eq!(editor.send(SCI_STYLEGETSIZEFRACTIONAL, 32, 0), 1100);
             editor.send(SCI_COLOURISE, 0, -1);
             if language.uses_container() {
                 editor
@@ -88,6 +90,51 @@ fn markdown_has_visible_syntax_in_both_themes() {
                 ),
                 0
             );
+            let styles: Vec<_> = [
+                "Plain body",
+                "visible heading",
+                "bold words",
+                "italic words",
+                "the documentation",
+                "inline_code",
+            ]
+            .into_iter()
+            .map(|needle| editor.send(SCI_GETSTYLEAT, text.find(needle).unwrap(), 0) as usize)
+            .collect();
+            let attributes = [
+                SCI_STYLEGETFORE,
+                SCI_STYLEGETBACK,
+                SCI_STYLEGETBOLD,
+                SCI_STYLEGETITALIC,
+                SCI_STYLEGETUNDERLINE,
+            ];
+            let before: Vec<Vec<_>> = styles
+                .iter()
+                .map(|style| {
+                    attributes
+                        .iter()
+                        .map(|message| editor.send(*message, *style, 0))
+                        .collect()
+                })
+                .collect();
+            assert_ne!(editor.send(SCI_STYLEGETUNDERLINE, styles[4], 0), 0);
+            editor.theme_with_font(
+                language,
+                Palette::new(dark),
+                &EditorFont::new("Segoe UI", 1250).unwrap(),
+            );
+            assert_eq!(editor.send(SCI_STYLEGETSIZEFRACTIONAL, 32, 0), 1250);
+            for (style, expected) in styles.iter().zip(before) {
+                assert_eq!(editor.send(SCI_STYLEGETSIZEFRACTIONAL, *style, 0), 1250);
+                let actual: Vec<_> = attributes
+                    .iter()
+                    .map(|message| editor.send(*message, *style, 0))
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "Changing fonts must preserve syntax attributes."
+                );
+            }
         }
         for (path, text, needles) in [
             (

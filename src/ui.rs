@@ -1,6 +1,9 @@
 use crate::{
     completion::{self, Api},
-    core::{self, CaseOp, Difference, Encoding, Eol, JsonNode, LineOp, Result, Search, SearchMode},
+    core::{
+        self, CaseOp, Difference, EditorFont, Encoding, Eol, JsonNode, LineOp, Result, Search,
+        SearchMode,
+    },
     editor::{self, DocumentHandle, Editor, Palette, sci::*},
     languages::{self, Language},
     session::{self, DocumentSnapshot, RecoveryWorker, Session},
@@ -68,6 +71,7 @@ const SPLIT: usize = 1050;
 const MAP: usize = 1051;
 const WRAP: usize = 1052;
 const ZOOM_RESET: usize = 1053;
+const EDITOR_FONT: usize = 1054;
 const THEME_SYSTEM: usize = 1060;
 const THEME_LIGHT: usize = 1061;
 const THEME_DARK: usize = 1062;
@@ -196,6 +200,157 @@ fn queue(event: Event) {
 }
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
+}
+
+const EDITOR_FONT_FLAGS: CHOOSEFONT_FLAGS = CF_SCREENFONTS
+    | CF_SCALABLEONLY
+    | CF_FORCEFONTEXIST
+    | CF_INITTOLOGFONTSTRUCT
+    | CF_LIMITSIZE
+    | CF_ENABLEHOOK
+    | CF_NOSCRIPTSEL;
+const FONT_STYLE_SUBCLASS: usize = 4;
+
+fn editor_logfont(font: &EditorFont, dpi: u32) -> Result<LOGFONTW> {
+    let family: Vec<u16> = font.family().encode_utf16().collect();
+    let mut logfont = LOGFONTW::default();
+    if family.len() >= logfont.lfFaceName.len() {
+        return Err(
+            "The Windows font dialog supports at most 31 UTF-16 units in a font family; the name has not been truncated."
+                .into(),
+        );
+    }
+    let height = i32::try_from((u64::from(font.size_hundredths()) * u64::from(dpi) + 3600) / 7200)
+        .map_err(|_| "The window DPI is too large for the Windows font dialog.")?;
+    if height == 0 {
+        return Err("Could not determine a valid font height for the window DPI.".into());
+    }
+    logfont.lfHeight = -height;
+    logfont.lfWeight = FW_NORMAL as i32;
+    logfont.lfCharSet = DEFAULT_CHARSET;
+    logfont.lfFaceName[..family.len()].copy_from_slice(&family);
+    Ok(logfont)
+}
+
+fn font_size_label(size_hundredths: u32) -> String {
+    let points = size_hundredths / 100;
+    let fraction = size_hundredths % 100;
+    if fraction == 0 {
+        points.to_string()
+    } else {
+        format!("{points}.{fraction:02}")
+            .trim_end_matches('0')
+            .to_owned()
+    }
+}
+
+fn font_from_dialog(logfont: &LOGFONTW, size_tenths: i32) -> Result<EditorFont> {
+    let size_hundredths = u32::try_from(size_tenths)
+        .ok()
+        .and_then(|size| size.checked_mul(10))
+        .ok_or("The font dialog returned an invalid point size.")?;
+    let end = logfont
+        .lfFaceName
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or("The font dialog returned an unterminated font family.")?;
+    let family = String::from_utf16(&logfont.lfFaceName[..end])
+        .map_err(|error| format!("The font dialog returned an invalid font family: {error}"))?;
+    EditorFont::new(family, size_hundredths)
+}
+
+struct FontDialogState {
+    size_text: Vec<u16>,
+    initialization_failed: bool,
+}
+
+unsafe extern "system" fn font_style_proc(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    unsafe {
+        if message == WM_ENABLE && w != 0 {
+            EnableWindow(hwnd, 0);
+            return 0;
+        }
+        if message == WM_NCDESTROY {
+            RemoveWindowSubclass(hwnd, Some(font_style_proc), id);
+        }
+        DefSubclassProc(hwnd, message, w, l)
+    }
+}
+
+unsafe extern "system" fn editor_font_hook(
+    hwnd: HWND,
+    message: u32,
+    _w: WPARAM,
+    l: LPARAM,
+) -> usize {
+    if message == WM_INITDIALOG {
+        unsafe {
+            let dialog = &*(l as *const CHOOSEFONTW);
+            let state = &mut *(dialog.lCustData as *mut FontDialogState);
+            let style = GetDlgItem(hwnd, cmb2 as i32);
+            let label = GetDlgItem(hwnd, stc2 as i32);
+            // CF_NOSTYLESEL only clears the initial selection. Disable the SDK style control,
+            // including attempts by the common dialog to re-enable it after a family change.
+            if style.is_null()
+                || label.is_null()
+                || SetWindowSubclass(style, Some(font_style_proc), FONT_STYLE_SUBCLASS, 0) == 0
+            {
+                state.initialization_failed = true;
+            } else {
+                EnableWindow(style, 0);
+                EnableWindow(label, 0);
+                state.initialization_failed = IsWindowEnabled(style) != 0
+                    || SetDlgItemTextW(hwnd, cmb3 as i32, state.size_text.as_ptr()) == 0;
+            }
+            if state.initialization_failed {
+                PostMessageW(hwnd, WM_COMMAND, IDCANCEL as usize, 0);
+            }
+        }
+    }
+    0
+}
+
+fn choose_editor_font(owner: HWND, dpi: u32, current: &EditorFont) -> Result<Option<EditorFont>> {
+    let mut logfont = editor_logfont(current, dpi)?;
+    let mut state = FontDialogState {
+        size_text: wide(&font_size_label(current.size_hundredths())),
+        initialization_failed: false,
+    };
+    let mut dialog = CHOOSEFONTW {
+        lStructSize: size_of::<CHOOSEFONTW>() as u32,
+        hwndOwner: owner,
+        lpLogFont: &mut logfont,
+        Flags: EDITOR_FONT_FLAGS,
+        lCustData: (&mut state as *mut FontDialogState) as isize,
+        lpfnHook: Some(editor_font_hook),
+        nSizeMin: (EditorFont::MIN_SIZE_HUNDREDTHS / 100) as i32,
+        nSizeMax: (EditorFont::MAX_SIZE_HUNDREDTHS / 100) as i32,
+        ..CHOOSEFONTW::default()
+    };
+    let accepted = unsafe { ChooseFontW(&mut dialog) } != 0;
+    let error = if accepted {
+        0
+    } else {
+        unsafe { CommDlgExtendedError() }
+    };
+    if state.initialization_failed {
+        return Err("Could not initialize the family-and-size-only font dialog.".into());
+    }
+    if !accepted {
+        return if error == 0 {
+            Ok(None)
+        } else {
+            Err(format!("Font dialog failed: {error:#x}"))
+        };
+    }
+    font_from_dialog(&logfont, dialog.iPointSize).map(Some)
 }
 
 unsafe fn new_menu(popup: bool) -> HMENU {
@@ -396,7 +551,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                         match header.code {
                             SCN_STYLENEEDED => queue(Event::Style(pane)),
                             SCN_FOCUSIN => queue(Event::Focus(pane)),
-                            SCN_UPDATEUI => {
+                            SCN_UPDATEUI | SCN_ZOOM => {
                                 EVENTS.with(|q| {
                                     let mut q = q.borrow_mut();
                                     if !q.iter().any(
@@ -861,6 +1016,7 @@ struct App {
     next_id: u64,
     palette: Palette,
     theme: String,
+    editor_font: EditorFont,
     font: HFONT,
     dpi: u32,
     map_visible: bool,
@@ -1095,6 +1251,7 @@ impl App {
                         (SPLIT, "Toggle split view\tCtrl+Alt+Right"),
                         (MAP, "Document map"),
                         (WRAP, "Word wrap"),
+                        (EDITOR_FONT, "Editor &font..."),
                         (ZOOM_RESET, "Reset zoom"),
                         (0, ""),
                         (THEME_SYSTEM, "Theme: Windows default"),
@@ -1355,17 +1512,34 @@ impl App {
                 RDW_INVALIDATE | RDW_ALLCHILDREN,
             );
         }
-        if !self.documents.is_empty() {
-            for (pane, index) in [(0, Some(self.primary)), (1, self.secondary)] {
-                if let Some(index) = index {
-                    self.editors[pane].theme(
-                        &self.languages[self.documents[index].language],
-                        self.palette,
-                    );
-                }
-            }
-            self.configure_map();
+        self.apply_editor_styles();
+    }
+    fn apply_editor_styles(&self) {
+        if self.documents.is_empty() {
+            return;
         }
+        for (pane, index) in [
+            (0, self.primary),
+            (1, self.secondary.unwrap_or(self.primary)),
+        ] {
+            self.editors[pane].theme_with_font(
+                &self.languages[self.documents[index].language],
+                self.palette,
+                &self.editor_font,
+            );
+        }
+        self.configure_map();
+    }
+    fn set_editor_font(&mut self, selection: Option<EditorFont>) {
+        let Some(font) = selection else {
+            return;
+        };
+        self.editor_font = font;
+        for editor in self.editors {
+            editor.send(SCI_SETZOOM, 0, 0);
+        }
+        self.apply_editor_styles();
+        self.touch();
     }
     fn set_font(&mut self) {
         let font = unsafe {
@@ -1590,8 +1764,11 @@ impl App {
         self.scratch.set_text(&snapshot.text)?;
         self.scratch
             .send(SCI_SETEOLMODE, snapshot.eol.scintilla(), 0);
-        self.scratch
-            .language(&self.languages[language], self.palette)?;
+        self.scratch.language_with_font(
+            &self.languages[language],
+            self.palette,
+            &self.editor_font,
+        )?;
         snapshot.id = self.next_id;
         self.next_id += 1;
         snapshot.text = String::new();
@@ -1652,7 +1829,11 @@ impl App {
             if let Some(index) = index {
                 let doc = &self.documents[index];
                 self.editors[pane].attach(&doc.handle);
-                self.editors[pane].language(&self.languages[doc.language], self.palette)?;
+                self.editors[pane].language_with_font(
+                    &self.languages[doc.language],
+                    self.palette,
+                    &self.editor_font,
+                )?;
                 self.editors[pane].send(SCI_SETEOLMODE, doc.snapshot.eol.scintilla(), 0);
                 self.editors[pane].send(SCI_SETWRAPMODE, self.wrap as usize, 0);
             }
@@ -1667,7 +1848,11 @@ impl App {
         }
         let doc = &self.documents[self.index()];
         self.map.attach(&doc.handle);
-        self.map.theme(&self.languages[doc.language], self.palette);
+        self.map.theme_with_font(
+            &self.languages[doc.language],
+            self.palette,
+            &self.editor_font,
+        );
         for style in 0..256 {
             self.map.send(SCI_STYLESETSIZEFRACTIONAL, style, 200);
         }
@@ -2018,6 +2203,7 @@ impl App {
             documents,
             active: self.index(),
             theme: self.theme.clone(),
+            editor_font: self.editor_font.clone(),
             custom_languages: self
                 .languages
                 .iter()
@@ -2659,6 +2845,10 @@ impl App {
                     ed.send(SCI_SETZOOM, 0, 0);
                 }
             }
+            EDITOR_FONT => {
+                let selection = choose_editor_font(self.hwnd, self.dpi, &self.editor_font)?;
+                self.set_editor_font(selection);
+            }
             THEME_SYSTEM | THEME_LIGHT | THEME_DARK => {
                 self.theme = match command {
                     THEME_LIGHT => "light",
@@ -3001,6 +3191,7 @@ impl App {
                 self.close_document()?;
             }
             Event::Updated(pane) => {
+                self.editors[pane].update_line_number_margin();
                 if pane == self.focused {
                     let index = self.index();
                     let position = self.editor().position();
@@ -3310,6 +3501,7 @@ pub fn run() -> Result<()> {
             next_id: 1,
             palette: Palette::new(false),
             theme: session.theme.clone(),
+            editor_font: session.editor_font,
             font: null_mut(),
             dpi: GetDpiForWindow(hwnd),
             map_visible: false,
@@ -3405,5 +3597,129 @@ pub fn run() -> Result<()> {
         }
         PANEL_BRUSH.with(|b| DeleteObject(b.replace(null_mut())));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod font_dialog_tests {
+    use super::*;
+
+    #[test]
+    fn logfont_initialization_keeps_unicode_and_fractional_size() {
+        let family = format!("{}X", "\u{1f680}".repeat(15));
+        let font = EditorFont::new(&family, 1250).unwrap();
+        let logfont = editor_logfont(&font, 96).unwrap();
+        assert_eq!(
+            String::from_utf16(&logfont.lfFaceName[..31]).unwrap(),
+            family
+        );
+        assert_eq!(logfont.lfFaceName[31], 0);
+        assert_eq!(logfont.lfHeight, -17);
+        assert_eq!(logfont.lfWeight, FW_NORMAL as i32);
+        assert_eq!(
+            (logfont.lfItalic, logfont.lfUnderline, logfont.lfStrikeOut),
+            (0, 0, 0)
+        );
+        assert_eq!(font_size_label(1100), "11");
+        assert_eq!(font_size_label(1250), "12.5");
+        assert_eq!(font_size_label(1234), "12.34");
+        assert!(
+            editor_logfont(&EditorFont::new("\u{1f680}".repeat(16), 1100).unwrap(), 96).is_err()
+        );
+        assert!(editor_logfont(&EditorFont::new("a".repeat(32), 1100).unwrap(), 96).is_err());
+        assert!(editor_logfont(&font, 0).is_err());
+    }
+
+    #[test]
+    fn dialog_results_are_validated_without_truncating_or_clamping() {
+        let font = EditorFont::new("Consolas", 1250).unwrap();
+        let mut logfont = editor_logfont(&font, 96).unwrap();
+        assert_eq!(font_from_dialog(&logfont, 125).unwrap(), font);
+        assert_eq!(
+            font_from_dialog(&logfont, 40).unwrap().size_hundredths(),
+            400
+        );
+        assert_eq!(
+            font_from_dialog(&logfont, 720).unwrap().size_hundredths(),
+            7200
+        );
+        for size in [-1, 0, 39, 721, i32::MAX] {
+            assert!(font_from_dialog(&logfont, size).is_err(), "{size}");
+        }
+        logfont.lfFaceName.fill(b'a' as u16);
+        assert!(font_from_dialog(&logfont, 110).is_err());
+        logfont.lfFaceName.fill(0);
+        logfont.lfFaceName[0] = 0xd800;
+        assert!(font_from_dialog(&logfont, 110).is_err());
+    }
+
+    #[cfg(windows)]
+    thread_local! {
+        static DIALOG_CHECKS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    #[cfg(windows)]
+    unsafe extern "system" fn inspect_dialog(
+        hwnd: HWND,
+        message: u32,
+        w: WPARAM,
+        l: LPARAM,
+    ) -> usize {
+        unsafe {
+            let result = editor_font_hook(hwnd, message, w, l);
+            if message == WM_INITDIALOG {
+                let style = GetDlgItem(hwnd, cmb2 as i32);
+                let mut checks = 0;
+                if !style.is_null() && IsWindowEnabled(style) == 0 {
+                    checks |= 1;
+                }
+                EnableWindow(style, 1);
+                if !style.is_null() && IsWindowEnabled(style) == 0 {
+                    checks |= 2;
+                }
+                if [chx1, chx2, cmb4].into_iter().all(|id| {
+                    let control = GetDlgItem(hwnd, id as i32);
+                    control.is_null()
+                        || GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE as isize == 0
+                        || IsWindowEnabled(control) == 0
+                }) {
+                    checks |= 4;
+                }
+                if IsWindowEnabled(GetDlgItem(hwnd, cmb5 as i32)) == 0 {
+                    checks |= 8;
+                }
+                if window_text(GetDlgItem(hwnd, cmb3 as i32)) == "12.5" {
+                    checks |= 16;
+                }
+                DIALOG_CHECKS.with(|value| value.set(checks));
+                PostMessageW(hwnd, WM_COMMAND, IDCANCEL as usize, 0);
+            }
+            result
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_dialog_only_offers_family_and_size_and_can_cancel() {
+        let font = EditorFont::new("Consolas", 1250).unwrap();
+        let mut logfont = editor_logfont(&font, 96).unwrap();
+        let mut state = FontDialogState {
+            size_text: wide(&font_size_label(font.size_hundredths())),
+            initialization_failed: false,
+        };
+        let mut dialog = CHOOSEFONTW {
+            lStructSize: size_of::<CHOOSEFONTW>() as u32,
+            lpLogFont: &mut logfont,
+            Flags: EDITOR_FONT_FLAGS,
+            lCustData: (&mut state as *mut FontDialogState) as isize,
+            lpfnHook: Some(inspect_dialog),
+            nSizeMin: 4,
+            nSizeMax: 72,
+            ..CHOOSEFONTW::default()
+        };
+        assert_eq!(unsafe { ChooseFontW(&mut dialog) }, 0);
+        assert_eq!(unsafe { CommDlgExtendedError() }, 0);
+        assert!(!state.initialization_failed);
+        assert_eq!(DIALOG_CHECKS.with(Cell::get), 31);
     }
 }
