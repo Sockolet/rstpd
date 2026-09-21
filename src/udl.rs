@@ -443,11 +443,20 @@ fn matched(text: &str, pos: usize, token: &str, ignore_case: bool) -> Option<usi
     if !ignore_case {
         return text[pos..].starts_with(token).then_some(token.len());
     }
-    let end = text[pos..]
-        .char_indices()
-        .nth(token.chars().count())
-        .map_or(text.len(), |(offset, _)| pos + offset);
-    (text[pos..end].to_lowercase() == token.to_lowercase()).then_some(end - pos)
+    // Compare lowercase prefixes incrementally: `to_lowercase` can change a character's
+    // length, so counting characters is not a safe way to size the candidate slice.
+    let token_lower = token.to_lowercase();
+    let mut lowered = String::with_capacity(token_lower.len());
+    for (offset, ch) in text[pos..].char_indices() {
+        lowered.extend(ch.to_lowercase());
+        if !token_lower.starts_with(&lowered) {
+            return None;
+        }
+        if lowered.len() == token_lower.len() {
+            return Some(offset + ch.len_utf8());
+        }
+    }
+    None
 }
 fn longest(text: &str, pos: usize, tokens: &[String], ignore: bool) -> Option<usize> {
     tokens
@@ -753,5 +762,14 @@ mod tests {
         assert!(import("<!DOCTYPE x [<!ENTITY x SYSTEM 'file:///secret'>]><x/>").is_err());
         assert!(import(&XML.replace("udlVersion=\"2.1\"", "udlVersion=\"9.9\"")).is_err());
         assert!(indexed("990", 24).is_err());
+    }
+    #[test]
+    fn case_insensitive_matching_survives_length_changing_lowercase() {
+        assert_eq!(matched("BEGIN rest", 0, "begin", true), Some(5));
+        assert_eq!(matched("begin", 0, "BEGIN", true), Some(5));
+        assert_eq!(matched("beg", 0, "begin", true), None);
+        assert_eq!(matched("\u{130}x", 0, "\u{130}", true), Some(2));
+        assert_eq!(matched("stra\u{df}e", 0, "stra\u{df}e", true), Some(7));
+        assert_eq!(matched("BEGIN", 0, "begin", false), None);
     }
 }

@@ -11,8 +11,14 @@ foreach ($package in $packages) {
         throw "Source integrity check failed: $archive"
     }
     $destination = Join-Path $root "vendor\$($package.Name)"
+    $stamp = Join-Path $destination '.rstpd-source-hash'
+    if ((Test-Path $destination) -and
+        (!(Test-Path $stamp) -or (Get-Content $stamp -Raw).Trim() -ne $package.Hash)) {
+        Remove-Item -Recurse -Force $destination
+    }
     if (!(Test-Path $destination)) {
         Expand-Archive $archive -DestinationPath (Join-Path $root 'vendor')
+        Set-Content -LiteralPath $stamp -Value $package.Hash -Encoding ascii
     }
 }
 $dataArchive = Join-Path $root 'vendor\scite566.zip'
