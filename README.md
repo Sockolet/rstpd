@@ -17,13 +17,13 @@ Download the portable Windows ZIP from the
 [GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\rstpd-0.2.5\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-0.2.5\rstpd.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-1.0.0\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-1.0.0\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\rstpd-0.2.5\rstpd.exe
-.\dist\rstpd-0.2.5\rstpd.exe .\example.rs .\example.json
+.\dist\rstpd-1.0.0\rstpd.exe
+.\dist\rstpd-1.0.0\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
@@ -31,7 +31,7 @@ instance may use a session directory at a time. Opening another instance
 does not forward filenames to the existing instance.
 
 Close an older rstpd instance before opening this release with the same session.
-Version 0.2 reads version-1 sessions and saves version-2 sessions, including
+Version 1.0 reads version-1 sessions and saves version-2 sessions, including
 language/completion definitions and optional editor-font preferences.
 Version 0.1 deliberately refuses version-2 sessions rather than silently dropping
 the new settings.
@@ -144,8 +144,8 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\rstpd-0.2.5\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-0.2.5\rstpd.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-1.0.0\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-1.0.0\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -241,7 +241,7 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-0.2.5-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-1.0.0-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.

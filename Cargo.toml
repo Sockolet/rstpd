@@ -1,6 +1,6 @@
 [package]
 name = "rstpd"
-version = "0.2.5"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.98"
 description = "A small, native Windows text editor without plugins"
