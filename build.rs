@@ -51,11 +51,14 @@ fn language_data() {
         }
         let mut out = String::new();
         let mut rest = text;
+        // Only consume the prefix once the reference is known to close: the trailing
+        // `out.push_str(rest)` below would otherwise emit it twice.
+        // expand("keep $(open") == "keep $(open"   (not "keep keep $(open")
         while let Some(start) = rest.find("$(") {
-            out.push_str(&rest[..start]);
             let Some(end) = rest[start + 2..].find(')') else {
                 break;
             };
+            out.push_str(&rest[..start]);
             let name = &rest[start + 2..start + 2 + end];
             if let Some(value) = props.get(name) {
                 out.push_str(&expand(value, props, depth + 1));

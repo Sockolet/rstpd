@@ -1040,6 +1040,13 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
         json5: bool,
     }
     impl Parser<'_> {
+        fn byte(&self) -> Result<u8> {
+            self.text
+                .as_bytes()
+                .get(self.pos)
+                .copied()
+                .ok_or_else(|| "Malformed JSON: the document ended unexpectedly.".to_owned())
+        }
         fn skip(&mut self) {
             loop {
                 while self.pos < self.text.len()
@@ -1070,7 +1077,7 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
             self.pos += 1;
             while self.pos < self.text.len() {
                 match self.text.as_bytes()[self.pos] {
-                    b'\\' => self.pos += 2,
+                    b'\\' => self.pos = (self.pos + 2).min(self.text.len()),
                     byte if byte == quote => {
                         self.pos += 1;
                         break;
@@ -1105,7 +1112,7 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
                 pointer: pointer.clone(),
                 span: start..start,
             });
-            match self.text.as_bytes()[self.pos] {
+            match self.byte()? {
                 open @ (b'{' | b'[') => {
                     let object = open == b'{';
                     let close = if object { b'}' } else { b']' };
@@ -1113,9 +1120,9 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
                     self.skip();
                     let mut count = 0;
                     let mut keys = HashSet::new();
-                    while self.text.as_bytes()[self.pos] != close {
+                    while self.byte()? != close {
                         let key = if object {
-                            let key = if matches!(self.text.as_bytes()[self.pos], b'"' | b'\'') {
+                            let key = if matches!(self.byte()?, b'"' | b'\'') {
                                 self.string()?
                             } else {
                                 let start = self.pos;
@@ -1154,7 +1161,7 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
                         self.value(Some(index), &key, format!("{pointer}/{segment}"))?;
                         count += 1;
                         self.skip();
-                        if self.text.as_bytes()[self.pos] == b',' {
+                        if self.byte()? == b',' {
                             self.pos += 1;
                             self.skip();
                         }

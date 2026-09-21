@@ -175,11 +175,11 @@ impl<'de> Deserialize<'de> for UniqueValue {
     }
 }
 
-/// Returns true for JSON5 and false for strict JSON. Values are validated, never evaluated.
-pub fn validate(text: &str) -> Result<bool> {
+/// Returns `(is_json5, tokens)`. Values are validated, never evaluated.
+fn validated_tokens(text: &str) -> Result<(bool, Vec<Token>)> {
     let parts = tokens(text)?;
     if serde_json::from_str::<UniqueValue>(text).is_ok() {
-        return Ok(false);
+        return Ok((false, parts));
     }
     json5::Deserializer::from_str(text).map_err(|e| format!("Invalid JSON/JSON5: {e}"))?;
     // The JSON5 deserializer narrows integers. Validate keys using a grammar-checked
@@ -204,12 +204,16 @@ pub fn validate(text: &str) -> Result<bool> {
     let validation =
         String::from_utf8(validation).expect("Only ASCII numeric lexemes are replaced");
     json5::from_str::<UniqueValue>(&validation).map_err(|e| format!("Invalid JSON/JSON5: {e}"))?;
-    Ok(true)
+    Ok((true, parts))
+}
+
+/// Returns true for JSON5 and false for strict JSON. Values are validated, never evaluated.
+pub fn validate(text: &str) -> Result<bool> {
+    validated_tokens(text).map(|(json5, _)| json5)
 }
 
 pub fn format(text: &str, compact: bool) -> Result<String> {
-    validate(text)?;
-    let tokens = tokens(text)?;
+    let (_, tokens) = validated_tokens(text)?;
     let mut out = String::new();
     let mut depth = 0;
     let newline = |out: &mut String, depth: usize| {
