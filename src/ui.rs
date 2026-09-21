@@ -955,6 +955,21 @@ fn encoding_options() -> Vec<Encoding> {
     core::encoding_options()
 }
 
+/// `fs::canonicalize` fails when the target does not exist yet, so fall back to
+/// canonicalizing the parent. Save-as must not be able to alias a path that is
+/// already open in another tab.
+fn canonical_target(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
+}
+
 struct Document {
     handle: DocumentHandle,
     snapshot: DocumentSnapshot,
@@ -2076,7 +2091,7 @@ impl App {
         } else {
             self.documents[index].snapshot.path.clone().unwrap()
         };
-        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canonical = canonical_target(&path);
         if self
             .documents
             .iter()
@@ -2171,6 +2186,7 @@ impl App {
         });
         if self.secondary.is_none() {
             self.focused = 0;
+            self.editors[1].attach(&self.documents[self.primary].handle);
         }
         self.refresh_views()?;
         self.json_document = None;
@@ -3141,9 +3157,35 @@ impl App {
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
-        let snapshot = self.snapshot()?;
-        // Wait for the final revision before allowing the window to close.
-        self.recovery.flush(self.revision + 1, snapshot)?;
+        // Show why the window is about to freeze: flush blocks on a full recovery write.
+        self.note("Saving recovery before exit...");
+        unsafe {
+            UpdateWindow(self.status);
+        }
+        let saved = self
+            .snapshot()
+            .and_then(|snapshot| self.recovery.flush(self.revision + 1, snapshot));
+        if let Err(error) = saved {
+            self.recovery_error = Some(error.clone());
+            self.update_status();
+            let unsaved = self
+                .documents
+                .iter()
+                .filter(|doc| doc.snapshot.dirty)
+                .count();
+            if ask(
+                self.hwnd,
+                &format!(
+                    "Recovery could not be saved: {error}\n\n\
+                     Exit anyway? {unsaved} tab(s) with unsaved edits will be lost.\n\
+                     Choose No to stay open and save them with File > Save as.",
+                ),
+                MB_YESNO | MB_ICONERROR | MB_DEFBUTTON2,
+            ) != IDYES
+            {
+                return Ok(());
+            }
+        }
         self.exiting = true;
         self.documents.clear();
         unsafe {
@@ -3330,8 +3372,17 @@ impl App {
                 }
             }
             Event::Drop(paths) => {
+                let mut failures = Vec::new();
                 for path in paths {
-                    self.open_path(&path, None)?;
+                    if let Err(error) = self.open_path(&path, None) {
+                        failures.push(error);
+                    }
+                }
+                if let Some(first) = failures.first() {
+                    return Err(match failures.len() {
+                        1 => first.clone(),
+                        count => format!("{first} ({} more file(s) also failed.)", count - 1),
+                    });
                 }
             }
             Event::Map(y) => {
@@ -3721,5 +3772,25 @@ mod font_dialog_tests {
         assert_eq!(unsafe { CommDlgExtendedError() }, 0);
         assert!(!state.initialization_failed);
         assert_eq!(DIALOG_CHECKS.with(Cell::get), 31);
+    }
+}
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_target_resolves_parents_for_new_files() {
+        let base = std::env::temp_dir();
+        let nested = base.join("rstpd-canonical-test");
+        std::fs::create_dir_all(&nested).unwrap();
+        let target = nested.join("..").join("new-file.txt");
+        let resolved = canonical_target(&target);
+        assert!(resolved.ends_with("new-file.txt"));
+        assert_eq!(
+            resolved.parent().unwrap(),
+            std::fs::canonicalize(&base).unwrap()
+        );
+        assert!(!resolved.to_string_lossy().contains(".."));
+        std::fs::remove_dir(&nested).unwrap();
     }
 }
