@@ -2,7 +2,6 @@ use crate::core::{EditorFont, Encoding, Eol, MAX_DOCUMENT_BYTES, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    hash::{Hash, Hasher},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -57,10 +56,17 @@ pub struct Session {
     pub completion_api: Vec<crate::completion::Api>,
 }
 
+/// FNV-1a (64-bit). Pinned on purpose: this value is written to `session.json` and
+/// compared after a restart, so it must not change when the Rust toolchain changes.
+/// `DefaultHasher` gives no such guarantee. Not cryptographic; used only to detect
+/// that a file changed outside the editor.
 pub fn fingerprint(bytes: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 pub fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -401,5 +407,13 @@ mod tests {
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_is_pinned_across_toolchain_releases() {
+        assert_eq!(fingerprint(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fingerprint(b"abc"), 0xe71f_a219_0541_574b);
+        assert_ne!(fingerprint(b"abc"), fingerprint(b"abd"));
+        assert_ne!(fingerprint(b"ab"), fingerprint(b"abc"));
     }
 }

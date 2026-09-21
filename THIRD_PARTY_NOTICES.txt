@@ -15,7 +15,7 @@ Only editor component sources and language data are used. No Notepad++
 application code, plugin code, or SciTE application code is incorporated.
 The source archives retain their original per-file notices.
 
-assets\language-coverage.tsv records factual language names and file extensions
+assets\language-coverage.psv records factual language names and file extensions
 from the Notepad++ language inventory (model date 20260714). It does not
 incorporate Notepad++ lexer or application implementations.
 
