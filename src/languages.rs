@@ -2,7 +2,7 @@ use crate::udl::UserLanguage;
 use std::{path::Path, sync::Arc};
 
 include!(concat!(env!("OUT_DIR"), "/language_data.rs"));
-pub const COVERAGE: &str = include_str!("..\\assets\\language-coverage.tsv");
+pub const COVERAGE: &str = include_str!("..\\assets\\language-coverage.psv");
 
 #[derive(Clone, Debug)]
 pub struct Language {
@@ -212,12 +212,14 @@ pub fn catalog(available: &[String]) -> Vec<Language> {
         .lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
     {
-        let fields: Vec<_> = row.split('|').collect();
-        let language = result
-            .iter_mut()
-            .find(|language| language.name == fields[1])
-            .expect("mapped built-in language");
-        for extension in fields[2].split_whitespace() {
+        let mut fields = row.split('|').skip(1);
+        let (Some(name), Some(extensions)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some(language) = result.iter_mut().find(|language| language.name == name) else {
+            continue;
+        };
+        for extension in extensions.split_whitespace() {
             if !language
                 .extensions
                 .split_whitespace()
@@ -538,5 +540,27 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 94);
+    }
+
+    #[test]
+    fn bundled_coverage_rows_all_resolve() {
+        let languages = catalog(&[]);
+        for (number, row) in COVERAGE.lines().enumerate() {
+            if row.starts_with('#') || row.is_empty() {
+                continue;
+            }
+            let fields: Vec<_> = row.split('|').collect();
+            assert!(
+                fields.len() >= 3,
+                "coverage line {}: expected 'upstream|mode|extensions'",
+                number + 1
+            );
+            assert!(
+                languages.iter().any(|language| language.name == fields[1]),
+                "coverage line {}: unknown mode {:?}",
+                number + 1,
+                fields[1]
+            );
+        }
     }
 }

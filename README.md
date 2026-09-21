@@ -121,7 +121,7 @@ G-I, J-L, M-O, P-R, S-U and V-Z** groups. Languages are alphabetized within
 each group, with additional columns for longer lists. Imported definitions
 have their own **User-defined** group; import/removal commands are at the bottom.
 
-`assets\language-coverage.tsv` records the 94 source-language entries and their
+`assets\language-coverage.psv` records the 94 source-language entries and their
 extensions from the upstream inventory with model date July 14, 2026, checked
 September 19, 2026. The internal `searchResult` pane format is not a source-file
 language. Shared/ambiguous extensions can still be selected explicitly in
