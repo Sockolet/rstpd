@@ -741,17 +741,16 @@ mod tests {
 
     #[test]
     fn analysis_cache_is_keyed_by_language() {
-        let py_text = "def gamma_three(x):\n    pass\n\nga";
-        let rs_text = "fn gamma_three(x: i32) {}\nga";
-        let python = suggestions(py_text, py_text.len(), "Python", &[], &[], false).words;
-        assert!(python.contains(&"gamma_three".into()));
-        let rust = suggestions(rs_text, rs_text.len(), "Rust", &[], &[], false).words;
-        assert!(rust.contains(&"gamma_three".into()));
-        // Verify the cache persists within the same language
-        let python_again = suggestions(py_text, py_text.len(), "Python", &[], &[], false).words;
-        assert_eq!(python, python_again);
-        // But switching languages should not pollute the cache
-        let rust2 = suggestions(rs_text, rs_text.len(), "Rust", &[], &[], false).words;
-        assert_eq!(rust, rust2);
+        // Identical text, different language: `strip` is a Python string method and
+        // `trim` is a Rust one, so a cache keyed only on the text would leak between them.
+        let text = "s = \"abc\"\ns.";
+        for _ in 0..3 {
+            let python = suggestions(text, text.len(), "Python", &[], &[], true).words;
+            assert!(python.contains(&"strip".into()), "{python:?}");
+            assert!(!python.contains(&"trim".into()), "{python:?}");
+            let rust = suggestions(text, text.len(), "Rust", &[], &[], true).words;
+            assert!(rust.contains(&"trim".into()), "{rust:?}");
+            assert!(!rust.contains(&"strip".into()), "{rust:?}");
+        }
     }
 }
