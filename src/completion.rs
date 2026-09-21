@@ -1,7 +1,7 @@
 use crate::core::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, ops::Range, sync::OnceLock};
+use std::{cell::RefCell, collections::BTreeSet, ops::Range, rc::Rc, sync::OnceLock};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Api {
@@ -45,20 +45,60 @@ fn builtins() -> &'static [Api] {
     APIS.get_or_init(|| {
         include_str!("..\\assets\\completion.api")
             .lines()
-            .map(|line| {
-                let parts: Vec<_> = line.splitn(3, '|').collect();
-                Api {
-                    language: parts[0].into(),
-                    receiver: parts[1].into(),
-                    name: parts[2].split('(').next().unwrap().into(),
-                    signature: parts[2].into(),
-                }
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, '|');
+                let language = parts.next()?;
+                let receiver = parts.next()?;
+                let signature = parts.next()?;
+                Some(Api {
+                    language: language.into(),
+                    receiver: receiver.into(),
+                    name: signature.split('(').next().unwrap_or(signature).into(),
+                    signature: signature.into(),
+                })
             })
             .collect()
     })
 }
 fn identifier(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Everything derived from one editor context window. Completion and call-tips are
+/// raised back-to-back for the same caret, so this is computed once and reused.
+struct Analysis {
+    masked: String,
+    scopes: Vec<(String, Range<usize>)>,
+    functions: Vec<Api>,
+}
+
+fn analysis(text: &str, language: &str) -> Rc<Analysis> {
+    thread_local! {
+        static CACHE: RefCell<Option<(String, String, Rc<Analysis>)>> = const { RefCell::new(None) };
+    }
+    let cached = CACHE.with_borrow(|cache| {
+        cache
+            .as_ref()
+            .filter(|(cached_text, cached_language, _)| {
+                cached_text == text && cached_language == language
+            })
+            .map(|(_, _, analysis)| analysis.clone())
+    });
+    if let Some(analysis) = cached {
+        return analysis;
+    }
+    let masked = code_mask(text, language);
+    let scopes = class_scopes(&masked, language);
+    let functions = functions_in(text, &masked, &scopes, language);
+    let analysis = Rc::new(Analysis {
+        masked,
+        scopes,
+        functions,
+    });
+    CACHE.with_borrow_mut(|cache| {
+        *cache = Some((text.to_owned(), language.to_owned(), analysis.clone()));
+    });
+    analysis
 }
 
 // Keep byte positions unchanged so the lexer, signatures and UTF-8 editor use the same offsets.
@@ -110,13 +150,16 @@ fn code_mask(text: &str, language: &str) -> String {
     String::from_utf8(result).expect("ASCII masks preserve UTF-8 boundaries")
 }
 
-fn functions(text: &str, language: &str) -> Vec<Api> {
+fn functions_in(
+    text: &str,
+    masked: &str,
+    owners: &[(String, Range<usize>)],
+    language: &str,
+) -> Vec<Api> {
     static NAMES: OnceLock<Regex> = OnceLock::new();
     let pattern=NAMES.get_or_init(||Regex::new(r"([\p{XID_Start}_$][\p{XID_Continue}$]*(?:[.:]{1,2}[\p{XID_Start}_$][\p{XID_Continue}$]*)*)\s*(?:<[^>\n]{0,200}>)?\s*\(").unwrap());
-    let masked = code_mask(text, language);
-    let owners = class_scopes(&masked, language);
     let mut result = Vec::new();
-    for captures in pattern.captures_iter(&masked).take(2000) {
+    for captures in pattern.captures_iter(masked).take(2000) {
         let matched = captures.get(0).unwrap();
         let full_name = captures.get(1).unwrap().as_str();
         let name = full_name.rsplit(['.', ':']).next().unwrap();
@@ -127,7 +170,7 @@ fn functions(text: &str, language: &str) -> Vec<Api> {
             continue;
         }
         let open = matched.end() - 1;
-        let Some(close) = matching_close(&masked, open) else {
+        let Some(close) = matching_close(masked, open) else {
             continue;
         };
         if close - open > 2048 {
@@ -184,7 +227,7 @@ fn functions(text: &str, language: &str) -> Vec<Api> {
             )
             .unwrap()
         });
-        for captures in arrows.captures_iter(&masked) {
+        for captures in arrows.captures_iter(masked) {
             let args = captures.get(2).unwrap();
             result.push(Api {
                 language: language_key(language).into(),
@@ -280,13 +323,14 @@ fn matching_close(text: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn receiver_type(text: &str, receiver: &str, caret: usize, language: &str) -> Option<String> {
+fn receiver_type(text: &str, analysis: &Analysis, receiver: &str, caret: usize) -> Option<String> {
     if matches!(receiver, "self" | "Self" | "this") {
-        return class_scopes(&code_mask(text, language), language)
-            .into_iter()
+        return analysis
+            .scopes
+            .iter()
             .filter(|(_, range)| range.contains(&caret))
             .min_by_key(|(_, range)| range.len())
-            .map(|(name, _)| name);
+            .map(|(name, _)| name.clone());
     }
     if receiver.ends_with(['"', '\'']) {
         return Some("string".into());
@@ -298,7 +342,6 @@ fn receiver_type(text: &str, receiver: &str, caret: usize, language: &str) -> Op
         return None;
     }
     let variable = regex::escape(receiver);
-    let masked = code_mask(text, language);
     let assignment = Regex::new(&format!(r"(?m)\b{variable}[ \t]*(?::[^=\n]+)?="))
         .expect("escaped bounded identifier");
     let annotation = Regex::new(&format!(
@@ -311,8 +354,8 @@ fn receiver_type(text: &str, receiver: &str, caret: usize, language: &str) -> Op
         "HashMap" | "Dictionary" | "dict" | "Map" => "map".into(),
         other => other.to_owned(),
     };
-    let binding = assignment.find_iter(&masked[..caret]).last();
-    if let Some(caps) = annotation.captures_iter(&masked[..caret]).last()
+    let binding = assignment.find_iter(&analysis.masked[..caret]).last();
+    if let Some(caps) = annotation.captures_iter(&analysis.masked[..caret]).last()
         && binding
             .as_ref()
             .is_none_or(|binding| caps.get(0).unwrap().end() >= binding.start())
@@ -417,11 +460,11 @@ pub fn suggestions(
             words.insert(word.to_owned());
         }
     };
-    let local = functions(text, language);
+    let analysis = analysis(text, language);
     let kind = receiver
         .as_deref()
-        .and_then(|name| receiver_type(text, name, caret, language));
-    for api in local.iter().chain(extra).chain(builtins()) {
+        .and_then(|name| receiver_type(text, &analysis, name, caret));
+    for api in analysis.functions.iter().chain(extra).chain(builtins()) {
         if api.language != language_key(language) && api.language != language {
             continue;
         }
@@ -436,14 +479,14 @@ pub fn suggestions(
             regex::escape(&receiver)
         ))
         .unwrap();
-        for captures in member.captures_iter(&code_mask(text, language)) {
+        for captures in member.captures_iter(&analysis.masked) {
             add(&captures[1]);
         }
     } else {
         for word in keywords.iter().flat_map(|set| set.split_whitespace()) {
             add(word);
         }
-        for word in code_mask(text, language).split(|ch: char| !identifier(ch)) {
+        for word in analysis.masked.split(|ch: char| !identifier(ch)) {
             add(word);
         }
     }
@@ -457,9 +500,9 @@ pub fn call_tip(text: &str, caret: usize, language: &str, extra: &[Api]) -> Opti
     if caret > text.len() || !text.is_char_boundary(caret) {
         return None;
     }
-    let masked = code_mask(&text[..caret], language);
+    let prefix_mask = code_mask(&text[..caret], language);
     let mut stack = Vec::new();
-    for (pos, ch) in masked.char_indices() {
+    for (pos, ch) in prefix_mask.char_indices() {
         match ch {
             '(' => stack.push(pos),
             ')' => {
@@ -469,6 +512,7 @@ pub fn call_tip(text: &str, caret: usize, language: &str, extra: &[Api]) -> Opti
         }
     }
     let open = *stack.last()?;
+    let analysis = analysis(text, language);
     let name_end = text[..open].trim_end().len();
     let identifier_end = if text[..name_end].ends_with('!') {
         name_end - 1
@@ -482,16 +526,20 @@ pub fn call_tip(text: &str, caret: usize, language: &str, extra: &[Api]) -> Opti
     }
     let kind = receiver
         .as_deref()
-        .and_then(|name| receiver_type(text, name, caret, language));
-    let local = functions(text, language);
-    let api = local.iter().chain(extra).chain(builtins()).find(|api| {
-        api.name == name
-            && (api.language == language_key(language) || api.language == language)
-            && receiver_matches(api, receiver.as_deref(), kind.as_deref())
-    })?;
+        .and_then(|name| receiver_type(text, &analysis, name, caret));
+    let api = analysis
+        .functions
+        .iter()
+        .chain(extra)
+        .chain(builtins())
+        .find(|api| {
+            api.name == name
+                && (api.language == language_key(language) || api.language == language)
+                && receiver_matches(api, receiver.as_deref(), kind.as_deref())
+        })?;
     let mut argument = 0;
     let mut depth = 0;
-    for ch in masked[open + 1..].chars() {
+    for ch in prefix_mask[open + 1..].chars() {
         match ch {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
@@ -653,5 +701,57 @@ mod tests {
             "multiply(left, right)"
         );
         assert!(call_tip("println!(\"{}\", ", 15, "Rust", &[]).is_some());
+    }
+
+    #[test]
+    fn bundled_completion_api_is_well_formed() {
+        let raw = include_str!("..\\assets\\completion.api");
+        for (number, line) in raw.lines().enumerate() {
+            assert_eq!(
+                line.split('|').count().min(3),
+                3,
+                "assets\\completion.api line {}: expected 'language|receiver|signature'",
+                number + 1
+            );
+            assert!(
+                line.splitn(3, '|').nth(2).is_some_and(|s| s.contains('(')),
+                "assets\\completion.api line {}: signature has no argument list",
+                number + 1
+            );
+        }
+        assert_eq!(builtins().len(), raw.lines().count());
+    }
+
+    #[test]
+    fn analysis_cache_does_not_leak_between_contexts() {
+        let first = "fn alpha_one(x: u32) {}\nal";
+        let second = "fn beta_two(x: u32) {}\nbe";
+        for _ in 0..3 {
+            let a = suggestions(first, first.len(), "Rust", &[], &[], false).words;
+            assert!(a.contains(&"alpha_one".into()), "{a:?}");
+            assert!(!a.contains(&"beta_two".into()), "{a:?}");
+            let b = suggestions(second, second.len(), "Rust", &[], &[], false).words;
+            assert!(b.contains(&"beta_two".into()), "{b:?}");
+            assert!(!b.contains(&"alpha_one".into()), "{b:?}");
+        }
+        let once = suggestions(first, first.len(), "Rust", &[], &[], false).words;
+        let twice = suggestions(first, first.len(), "Rust", &[], &[], false).words;
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn analysis_cache_is_keyed_by_language() {
+        let py_text = "def gamma_three(x):\n    pass\n\nga";
+        let rs_text = "fn gamma_three(x: i32) {}\nga";
+        let python = suggestions(py_text, py_text.len(), "Python", &[], &[], false).words;
+        assert!(python.contains(&"gamma_three".into()));
+        let rust = suggestions(rs_text, rs_text.len(), "Rust", &[], &[], false).words;
+        assert!(rust.contains(&"gamma_three".into()));
+        // Verify the cache persists within the same language
+        let python_again = suggestions(py_text, py_text.len(), "Python", &[], &[], false).words;
+        assert_eq!(python, python_again);
+        // But switching languages should not pollute the cache
+        let rust2 = suggestions(rs_text, rs_text.len(), "Rust", &[], &[], false).words;
+        assert_eq!(rust, rust2);
     }
 }
