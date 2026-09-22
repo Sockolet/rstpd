@@ -17,13 +17,13 @@ Download the portable Windows ZIP from the
 [GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\rstpd-1.0.0\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-1.0.0\rstpd.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-1.1.2\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-1.1.2\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\rstpd-1.0.0\rstpd.exe
-.\dist\rstpd-1.0.0\rstpd.exe .\example.rs .\example.json
+.\dist\rstpd-1.1.2\rstpd.exe
+.\dist\rstpd-1.1.2\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
@@ -31,8 +31,8 @@ instance may use a session directory at a time. Opening another instance
 does not forward filenames to the existing instance.
 
 Close an older rstpd instance before opening this release with the same session.
-Version 1.0 reads version-1 sessions and saves version-2 sessions, including
-language/completion definitions and optional editor-font preferences.
+Version 1.1 reads version-1 sessions and saves version-2 sessions, including
+language/completion definitions, optional editor-font and symbol-display preferences.
 Version 0.1 deliberately refuses version-2 sessions rather than silently dropping
 the new settings.
 
@@ -42,6 +42,8 @@ the new settings.
 |---|---|
 | Native UI | Windows title bar, menus, dialogs and controls; DPI-aware Segoe UI chrome, light/dark/system themes, closeable tabs and a compact Lucide icon toolbar |
 | Editor font | Native family/size selection, 4-72 pt, saved per workspace and shared by both editing panes and future tabs |
+| Character count | Total characters beside line/column, or selected out of total when text is selected |
+| Show symbols | Independent whitespace, EOL, non-printing/control-character markers, Show All, indentation guides and wrap markers |
 | Highlighting | All 94 source-language inventory entries mapped, plus the full pinned Lexilla catalog; filename detection, mode selection, and data-only UDL 2.0/2.1 import |
 | Markdown | CommonMark/GFM parsing with visible headings, emphasis, links, lists, quotes, tasks, tables, inline/fenced/indented code and strikethrough |
 | Completion | Keywords, local declarations, member/context suggestions, common built-in APIs, parameter hints and importable completion signatures |
@@ -49,6 +51,7 @@ the new settings.
 | Split screen | Two editable views of the same document or two different documents |
 | Document map | Clickable compact view with the visible text range highlighted; scroll the map for long documents |
 | Search | Normal, extended and advanced regex, including look-ahead/look-behind and pattern backreferences; case/whole-word options, wrap-around and replacement |
+| Find All | Current/all-open-tab searches with grouped matches, highlighted snippets, exact-match navigation and a resizable bottom results panel |
 | Compare | Debounced background comparison, changed-line and inline character highlighting, linked scrolling and difference navigation |
 | JSON | Lossless JSON/JSON5 pretty-print/minify, automatically refreshed tree, RFC 6901 pointers and source-span navigation |
 | Text operations | Upper/lower/title/sentence/inverted case; case-sensitive, case-insensitive, natural and exact decimal sorting; reverse/join, deduplication and whitespace operations |
@@ -72,6 +75,12 @@ line comparison.
 Line operations affect complete selected lines, or the whole document when
 there is no selection. Case conversion operates on selected text, including
 rectangular/multiple selections. These edits participate in undo.
+The status bar shows `4995 characters` with no text selected, or
+`852 of 4995 characters` for a selection. Counts follow the active editing
+pane and include the actual text in multiple/rectangular selections without
+double-counting overlaps or counting virtual space. Characters mean Unicode
+code points, not UTF-8 bytes: `U+1F680` counts as one, combining marks are
+separate, and CR/LF count separately. Tabs and other stored characters count too.
 Numeric sorting compares decimal digits without floating-point rounding, so
 large integer values remain correctly ordered. Every selected line must contain
 a decimal number; invalid input is reported before any edits are applied.
@@ -114,6 +123,69 @@ Line-number margins adjust to the font size, zoom and document line count.
 The Windows chooser reports names that cannot fit its 31-UTF-16-unit family
 field rather than truncating Unicode names.
 
+### Show symbols
+
+Use **View > Show symbols** to toggle these options independently:
+
+| Option | Display |
+|---|---|
+| Show space and tab | Dots for spaces and arrows for tabs |
+| Show end of line | CR/LF markers for the actual line-ending characters |
+| Show non-printing characters | Named markers for non-breaking/Unicode spaces, zero-width characters, directional formatting and separators |
+| Show control characters & Unicode EOL | Named markers for C0/C1 controls, DEL, NEL, LS and PS; normal tabs and CR/LF remain controlled by the first two options |
+| Show all characters | Turns the preceding four options on together, or off together when all are already enabled |
+| Show indent guide | Vertical guides for indentation |
+| Show wrap symbol | Visual wrap markers when **View > Word wrap** is enabled |
+
+**Show all characters** does not alter indentation guides or wrap markers.
+NEL/LS/PS are visible if either non-printing or control-character display is on.
+Hidden control characters use an unboxed space so they remain selectable.
+These are view settings only: bytes, encoding, dirty state and undo history are
+unchanged. Settings persist per workspace, survive theme/font changes, and apply
+to both editing panes and new tabs. The document map and search results remain
+uncluttered. Older sessions retain the previous control-character visibility.
+
+### Find All and search results
+
+Open Find/Replace with **Ctrl+F** or **Ctrl+H**, enter a query, then choose
+**Find all: current document** or **Find all: all open documents**. The same
+commands are available under **Search**. Normal, extended and regex modes,
+**Match case**, and **Whole word** use the same settings as Find Next.
+Find and Replace inputs have permanent labels, contrasting fill colors and
+visible borders, with an accent border on the focused field. Search and result
+buttons have filled, outlined surfaces and distinct hover, pressed, focus and
+disabled states in both themes. At narrower window sizes, Find All actions move
+to an additional row instead of overlapping other controls.
+Open documents are searched as they appear in the editor, including unsaved
+edits and untitled tabs; this does not search unopened files on disk.
+
+The bottom panel lists a summary, collapsible document groups, and one row per
+match with its line, column and a highlighted snippet. Columns count Unicode
+characters and honor tab stops. Multiline and zero-width matches are labeled;
+navigation selects the full match even when the preview is shortened.
+
+- Double-click a match, or move the results caret to it and press **Enter**.
+- **F4 / Shift+F4** or **Next / Previous** navigates and wraps through matches.
+- Drag the divider above the panel to resize it.
+- **Close** hides the panel without losing results; **Ctrl+Alt+R** reopens it.
+- **Clear** removes the displayed results; **Cancel** stops an active search.
+- Results are read-only but can be selected/copied. Editing commands cannot
+  accidentally modify the source document while the results editor has focus.
+
+Each search replaces the previous result list. Searching runs in a background
+worker over snapshots, without changing document text or dirty state. If a
+document changes or closes after searching, its old results cannot navigate
+to potentially incorrect positions; run Find All again. Changes to other
+documents do not invalidate unaffected matches. Search results are transient
+and are not written to recovery files.
+
+Find All retains at most **10,000 matches** and explicitly reports truncation.
+It accepts up to **16 MiB per document / 64 MiB combined**, with the existing
+per-document regex budget and a ten-second batch budget checked between matches.
+Cancellation is checked between matches/documents, so a running regex evaluation
+may finish before cancellation is acknowledged. A processing failure is shown
+in the panel, not reported as zero matches or a silently partial success.
+
 ## Language definitions and completion
 
 The Language menu starts with **Plain text**, followed by fixed **A-C, D-F,
@@ -144,8 +216,8 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\rstpd-1.0.0\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-1.0.0\rstpd.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-1.1.2\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-1.1.2\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -159,6 +231,9 @@ The completion API import is associated with the active file's language.
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+F or Ctrl+H | Find and replace |
 | F3 / Shift+F3 | Next / previous match |
+| Ctrl+Alt+Enter / Ctrl+Shift+Enter | Find All in current document / all open documents |
+| F4 / Shift+F4 | Next / previous Find All result |
+| Ctrl+Alt+R | Toggle search-results panel |
 | Ctrl+D / Ctrl+Shift+L | Select next / all occurrences |
 | Ctrl+U / Ctrl+Shift+U | Lowercase / uppercase selections |
 | Ctrl+Space / Ctrl+Shift+Space | Completion suggestions / function parameter hint |
@@ -166,7 +241,7 @@ The completion API import is associated with the active file's language.
 | F7 / Shift+F7 | Next / previous difference |
 | Ctrl+Alt+J / Ctrl+Alt+T | Format JSON / toggle JSON tree |
 | Ctrl+mouse wheel | Editor zoom |
-| Escape | Close search bar |
+| Escape | Close search bar, or hide search results when that panel has focus |
 
 Extended search/replacement recognizes `\n`, `\r`, `\t`, `\\`, `\0`,
 `\xHH` and `\uHHHH`. Invalid escapes are reported, not silently interpreted.
@@ -241,7 +316,7 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-1.0.0-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-1.1.2-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.
@@ -269,6 +344,7 @@ live editing, split/map views and recovery, rather than only checking lexer IDs.
 ## Source layout and trust boundary
 
 - `src\ui.rs`: native Windows UI, event queue and command wiring.
+- `src\controls.rs`: visible button/input surfaces and DPI-aware search layout.
 - `src\toolbar.rs`: theme-aware Lucide vector icons and native tooltip ownership.
 - `src\editor.rs`: editor/lexer FFI boundary and view configuration.
 - `src\native_bridge.cxx`: minimal adapter releasing owned native document references.
@@ -278,6 +354,8 @@ live editing, split/map views and recovery, rather than only checking lexer IDs.
 - `src\syntax.rs`: shared semantic token roles and font-attribute selection.
 - `src\json_tools.rs`: bounded JSON/JSON5 validation and lossless formatting.
 - `src\core.rs`: encoding, bounded search, text transforms, diff and JSON spans.
+- `src\search_results.rs`: bounded multi-document matches, Unicode previews and result-row mappings.
+- `src\symbols.rs`: persistent symbol-display flags and non-printing character names.
 - `src\session.rs`: atomic persistence, session validation and recovery worker.
 - `src\languages.rs`: app-owned language aliases and keyword selection.
 - `build.rs`: static native builds and build-time extraction of lexer constants,

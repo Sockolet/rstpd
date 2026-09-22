@@ -204,6 +204,27 @@ pub struct Editor {
     _ui_thread: PhantomData<Rc<()>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterCounts {
+    pub total: usize,
+    pub selected: usize,
+}
+
+impl std::fmt::Display for CharacterCounts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let noun = if self.total == 1 {
+            "character"
+        } else {
+            "characters"
+        };
+        if self.selected == 0 {
+            write!(formatter, "{} {noun}", self.total)
+        } else {
+            write!(formatter, "{} of {} {noun}", self.selected, self.total)
+        }
+    }
+}
+
 pub struct DocumentHandle {
     raw: NonNull<c_void>,
     _ui_thread: PhantomData<Rc<()>>,
@@ -329,6 +350,141 @@ impl Editor {
     }
     pub fn position(self) -> usize {
         self.send(SCI_GETCURRENTPOS, 0, 0) as usize
+    }
+    pub fn character_counts(self) -> Result<CharacterCounts> {
+        const UTF32_INDEX: usize = 1;
+        // One document-owned index keeps totals current on edits without scanning or
+        // copying the whole buffer for every caret movement or status refresh.
+        if self.send(SCI_GETLINECHARACTERINDEX, 0, 0) & UTF32_INDEX as isize == 0 {
+            self.send(SCI_SETSTATUS, 0, 0);
+            self.send(SCI_ALLOCATELINECHARACTERINDEX, UTF32_INDEX, 0);
+            self.check_status()?;
+            if self.send(SCI_GETLINECHARACTERINDEX, 0, 0) & UTF32_INDEX as isize == 0 {
+                return Err("Could not initialize the document's Unicode character index.".into());
+            }
+        }
+        let lines = self.send(SCI_GETLINECOUNT, 0, 0) as usize;
+        let total = self.send(SCI_INDEXPOSITIONFROMLINE, lines, UTF32_INDEX as isize) as usize;
+        let mut ranges: Vec<Range<usize>> = (0..self.send(SCI_GETSELECTIONS, 0, 0) as usize)
+            .filter_map(|index| {
+                let start = self.send(SCI_GETSELECTIONNSTART, index, 0) as usize;
+                let end = self.send(SCI_GETSELECTIONNEND, index, 0) as usize;
+                (start < end).then_some(start..end)
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut selected = 0usize;
+        let mut merged: Option<Range<usize>> = None;
+        for range in ranges {
+            match &mut merged {
+                Some(previous) if range.start <= previous.end => {
+                    previous.end = previous.end.max(range.end);
+                }
+                Some(previous) => {
+                    selected += self.count_indexed_range(previous.clone(), total)?;
+                    *previous = range;
+                }
+                None => merged = Some(range),
+            }
+        }
+        if let Some(range) = merged {
+            selected += self.count_indexed_range(range, total)?;
+        }
+        Ok(CharacterCounts { total, selected })
+    }
+    fn count_indexed_range(self, range: Range<usize>, total: usize) -> Result<usize> {
+        self.validate_range(&range)?;
+        if range == (0..self.length()) {
+            return Ok(total);
+        }
+        let first = self.send(SCI_LINEFROMPOSITION, range.start, 0) as usize;
+        let last = self.send(SCI_LINEFROMPOSITION, range.end, 0) as usize;
+        if first == last {
+            return Ok(self.send(SCI_COUNTCHARACTERS, range.start, range.end as isize) as usize);
+        }
+        let first_end = self.send(SCI_POSITIONFROMLINE, first + 1, 0);
+        let last_start = self.send(SCI_POSITIONFROMLINE, last, 0) as usize;
+        let middle = self.send(SCI_INDEXPOSITIONFROMLINE, last, 1)
+            - self.send(SCI_INDEXPOSITIONFROMLINE, first + 1, 1);
+        Ok((self.send(SCI_COUNTCHARACTERS, range.start, first_end)
+            + middle
+            + self.send(SCI_COUNTCHARACTERS, last_start, range.end as isize)) as usize)
+    }
+    fn representation(self, character: char, label: Option<&str>, boxed: bool) {
+        let mut bytes = [0u8; 5];
+        character.encode_utf8(&mut bytes[..4]);
+        unsafe {
+            if let Some(label) = label {
+                // An empty representation can underflow native width calculations. Use a
+                // plain space when hiding controls so they remain selectable and editable.
+                let label = CString::new(label).expect("static symbol label");
+                self.send_raw(
+                    SCI_SETREPRESENTATION,
+                    bytes.as_ptr() as usize,
+                    label.as_ptr() as isize,
+                );
+                self.send_raw(
+                    SCI_SETREPRESENTATIONAPPEARANCE,
+                    bytes.as_ptr() as usize,
+                    boxed as isize,
+                );
+            } else {
+                self.send_raw(SCI_CLEARREPRESENTATION, bytes.as_ptr() as usize, 0);
+            }
+        }
+    }
+    pub fn show_symbols(self, options: crate::symbols::ShowSymbols, palette: Palette) {
+        use crate::symbols::{C0, C1, NON_PRINTING};
+        self.send(SCI_SETVIEWWS, options.whitespace as usize, 0);
+        self.send(SCI_SETVIEWEOL, options.eol as usize, 0);
+        self.send(
+            SCI_SETINDENTATIONGUIDES,
+            if options.indent_guides { 3 } else { 0 },
+            0,
+        );
+        self.send(SCI_SETWRAPVISUALFLAGS, options.wrap_markers as usize, 0);
+        self.send(SCI_SETWHITESPACEFORE, 1, palette.muted as isize);
+        self.send(SCI_SETWHITESPACESIZE, 2, 0);
+        self.send(SCI_STYLESETFORE, 37, palette.border as isize);
+        self.send(SCI_STYLESETFORE, 38, palette.accent as isize);
+        self.send(SCI_STYLESETFORE, 36, palette.muted as isize);
+        self.send(SCI_SETCONTROLCHARSYMBOL, 0, 0);
+        for (code, name) in C0.iter().enumerate() {
+            if matches!(code, 9 | 10 | 13) {
+                continue;
+            }
+            self.representation(
+                char::from(code as u8),
+                Some(if options.controls { name } else { " " }),
+                options.controls,
+            );
+        }
+        self.representation(
+            '\u{7f}',
+            Some(if options.controls { "DEL" } else { " " }),
+            options.controls,
+        );
+        for (offset, name) in C1.iter().enumerate() {
+            let show = options.controls || (offset == 5 && options.non_printing);
+            self.representation(
+                char::from(0x80 + offset as u8),
+                Some(if show { name } else { " " }),
+                show,
+            );
+        }
+        for (ch, name) in [('\u{2028}', "LS"), ('\u{2029}', "PS")] {
+            let show = options.controls || options.non_printing;
+            self.representation(ch, Some(if show { name } else { " " }), show);
+        }
+        for (ch, name) in NON_PRINTING {
+            self.representation(*ch, options.non_printing.then_some(*name), true);
+        }
+    }
+    pub fn set_read_only_text(self, text: &str) -> Result<()> {
+        self.send(SCI_SETREADONLY, 0, 0);
+        let result = self.set_text(text);
+        self.send(SCI_SETREADONLY, 1, 0);
+        result
     }
     pub fn text(self) -> Result<String> {
         let len = self.length();

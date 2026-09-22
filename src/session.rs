@@ -51,6 +51,8 @@ pub struct Session {
     #[serde(default)]
     pub editor_font: EditorFont,
     #[serde(default)]
+    pub show_symbols: crate::symbols::ShowSymbols,
+    #[serde(default)]
     pub custom_languages: Vec<crate::udl::UserLanguage>,
     #[serde(default)]
     pub completion_api: Vec<crate::completion::Api>,

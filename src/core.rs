@@ -589,19 +589,32 @@ impl Search {
     }
     pub fn matches(&self, text: &str) -> Result<Vec<Range<usize>>> {
         let mut out = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        for m in self.regex.find_iter(text) {
+        self.visit_matches(text, |range| {
             if out.len() == 100_000 {
                 return Err("More than 100,000 matches; narrow the search.".into());
             }
+            out.push(range);
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+    pub fn visit_matches(
+        &self,
+        text: &str,
+        mut visit: impl FnMut(Range<usize>) -> Result<bool>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for m in self.regex.find_iter(text) {
             if Instant::now() > deadline {
                 return Err(
                     "Search exceeded its time budget. Narrow the expression or selection.".into(),
                 );
             }
-            out.push(m.map_err(search_error)?.range());
+            if !visit(m.map_err(search_error)?.range())? {
+                break;
+            }
         }
-        Ok(out)
+        Ok(())
     }
     pub fn replacement(
         &self,

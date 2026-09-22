@@ -1,12 +1,15 @@
 use crate::{
     completion::{self, Api},
+    controls::{self, SearchLayout},
     core::{
         self, CaseOp, Difference, EditorFont, Encoding, Eol, JsonNode, LineOp, Result, Search,
         SearchMode,
     },
     editor::{self, DocumentHandle, Editor, Palette, sci::*},
     languages::{self, Language},
+    search_results::{self, Input as SearchInput, Link as ResultLink, Results as SearchResults},
     session::{self, DocumentSnapshot, RecoveryWorker, Session},
+    symbols::ShowSymbols,
     toolbar::{self, Icon, Tooltips},
     udl::{self, Highlight},
 };
@@ -18,7 +21,11 @@ use std::{
     os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -28,7 +35,7 @@ use windows_sys::Win32::{
         LibraryLoader::*,
         Ole::RevokeDragDrop,
         Registry::*,
-        SystemServices::{MK_LBUTTON, SS_CENTERIMAGE},
+        SystemServices::{MK_LBUTTON, SS_CENTERIMAGE, SS_NOTIFY},
     },
     UI::{
         Controls::{Dialogs::*, *},
@@ -90,6 +97,21 @@ const ENCODING_BASE: usize = 5000;
 const REOPEN_BASE: usize = 5200;
 const ABOUT: usize = 1150;
 const SEARCH_CLOSE: usize = 1160;
+const FIND_ALL_CURRENT: usize = 1170;
+const FIND_ALL_OPEN: usize = 1171;
+const RESULTS_TOGGLE: usize = 1172;
+const RESULTS_NEXT: usize = 1173;
+const RESULTS_PREVIOUS: usize = 1174;
+const RESULTS_CLEAR: usize = 1175;
+const RESULTS_CLOSE: usize = 1176;
+const RESULTS_CANCEL: usize = 1177;
+const SYMBOL_SPACE: usize = 1300;
+const SYMBOL_EOL: usize = 1301;
+const SYMBOL_NONPRINTING: usize = 1302;
+const SYMBOL_CONTROLS: usize = 1303;
+const SYMBOL_ALL: usize = 1304;
+const SYMBOL_INDENT: usize = 1305;
+const SYMBOL_WRAP: usize = 1306;
 const TITLE_CASE: usize = 1200;
 const SENTENCE_CASE: usize = 1201;
 const INVERT_CASE: usize = 1202;
@@ -112,6 +134,8 @@ const PARAMETER_HINT: usize = 1403;
 const LANGUAGE_BASE: usize = 2000;
 const TREE_ID: usize = 301;
 const TAB_ID: usize = 302;
+const RESULTS_EDITOR_ID: usize = 105;
+const RESULTS_DIVIDER_ID: usize = 304;
 const TOOLBAR: [toolbar::Button; 8] = [
     toolbar::Button {
         command: NEW,
@@ -167,11 +191,12 @@ thread_local! {
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
     static COLORS: Cell<Palette> = Cell::new(Palette::new(false));
     static PANEL_BRUSH: Cell<HBRUSH> = const { Cell::new(null_mut()) };
+    static FIELD_BRUSH: Cell<HBRUSH> = const { Cell::new(null_mut()) };
     static UI_FONT: Cell<HFONT> = const { Cell::new(null_mut()) };
     static MENU_LABELS: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
     static MENUS: RefCell<Vec<HMENU>> = const { RefCell::new(Vec::new()) };
     static TREE_UPDATING: Cell<bool> = const {Cell::new(false)};
-    static HOT_TOOL: Cell<HWND> = const {Cell::new(null_mut())};
+    static HOT_BUTTON: Cell<HWND> = const {Cell::new(null_mut())};
     static ICON_ERROR_REPORTED: Cell<bool> = const {Cell::new(false)};
 }
 
@@ -194,6 +219,8 @@ enum Event {
     Drop(Vec<PathBuf>),
     Map(i32),
     SplitDrag(i32),
+    ResultActivate,
+    ResultsResize(i32),
 }
 fn queue(event: Event) {
     EVENTS.with(|q| q.borrow_mut().push_back(event));
@@ -540,12 +567,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             }
             WM_GETMINMAXINFO => {
                 let info = &mut *(l as *mut MINMAXINFO);
-                info.ptMinTrackSize = POINT { x: 780, y: 480 };
+                let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+                info.ptMinTrackSize = POINT {
+                    x: 780 * dpi / 96,
+                    y: 480 * dpi / 96,
+                };
                 return 0;
             }
             WM_NOTIFY => {
                 let header = &*(l as *const NMHDR);
                 match header.idFrom {
+                    RESULTS_EDITOR_ID if header.code == SCN_DOUBLECLICK => {
+                        queue(Event::ResultActivate)
+                    }
                     101 | 102 => {
                         let pane = header.idFrom - 101;
                         match header.code {
@@ -609,9 +643,29 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
                 let palette = COLORS.with(Cell::get);
-                SetTextColor(w as HDC, palette.text);
-                SetBkColor(w as HDC, palette.panel);
-                return PANEL_BRUSH.with(Cell::get) as isize;
+                let field = matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX)
+                    || matches!(GetDlgCtrlID(l as HWND), 401 | 402);
+                SetTextColor(
+                    w as HDC,
+                    if IsWindowEnabled(l as HWND) != 0 {
+                        palette.text
+                    } else {
+                        palette.muted
+                    },
+                );
+                SetBkColor(
+                    w as HDC,
+                    if field {
+                        controls::Colors::new(palette).field
+                    } else {
+                        palette.panel
+                    },
+                );
+                return if field {
+                    FIELD_BRUSH.with(Cell::get)
+                } else {
+                    PANEL_BRUSH.with(Cell::get)
+                } as isize;
             }
             WM_DRAWITEM => {
                 let item = &*(l as *const DRAWITEMSTRUCT);
@@ -624,7 +678,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                         item,
                         button.icon,
                         COLORS.with(Cell::get),
-                        HOT_TOOL.with(Cell::get) == item.hwndItem,
+                        HOT_BUTTON.with(Cell::get) == item.hwndItem,
+                    ) {
+                        Ok(()) => return 1,
+                        Err(error) => {
+                            if !ICON_ERROR_REPORTED.with(|reported| reported.replace(true)) {
+                                queue(Event::RenderError(error));
+                            }
+                        }
+                    }
+                }
+                if item.CtlType == ODT_BUTTON {
+                    match controls::draw_button(
+                        item,
+                        &window_text(item.hwndItem),
+                        UI_FONT.with(Cell::get),
+                        COLORS.with(Cell::get),
+                        HOT_BUTTON.with(Cell::get) == item.hwndItem,
                     ) {
                         Ok(()) => return 1,
                         Err(error) => {
@@ -637,14 +707,39 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 if item.CtlType == ODT_MENU {
                     let label = MENU_LABELS
                         .with(|labels| labels.borrow().get(item.itemData.wrapping_sub(1)).cloned());
-                    if let Some((title, _)) = label {
+                    if let Some((title, top)) = label {
+                        let palette = COLORS.with(Cell::get);
+                        let selected = item.itemState & (ODS_SELECTED | ODS_HOTLIGHT) != 0;
+                        let brush = CreateSolidBrush(if selected {
+                            palette.selection
+                        } else {
+                            palette.panel
+                        });
+                        FillRect(item.hDC, &item.rcItem, brush);
+                        DeleteObject(brush);
+                        let mut label_rect = item.rcItem;
+                        if !top {
+                            label_rect.left += (18 * GetDpiForWindow(hwnd) / 96) as i32;
+                        }
                         paint_label(
                             item.hDC,
-                            &item.rcItem,
+                            &label_rect,
                             &title,
                             item.itemState & (ODS_SELECTED | ODS_HOTLIGHT) != 0,
                             item.itemState & ODS_DISABLED != 0,
                         );
+                        if item.itemState & ODS_CHECKED != 0 {
+                            let scale = GetDpiForWindow(hwnd) as i32;
+                            let x = item.rcItem.left + 5 * scale / 96;
+                            let y = (item.rcItem.top + item.rcItem.bottom) / 2;
+                            let pen = CreatePen(PS_SOLID, (2 * scale / 96).max(1), palette.text);
+                            let old = SelectObject(item.hDC, pen);
+                            MoveToEx(item.hDC, x, y, null_mut());
+                            LineTo(item.hDC, x + 3 * scale / 96, y + 3 * scale / 96);
+                            LineTo(item.hDC, x + 9 * scale / 96, y - 4 * scale / 96);
+                            SelectObject(item.hDC, old);
+                            DeleteObject(pen);
+                        }
                     }
                     return 1;
                 }
@@ -758,7 +853,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
     }
 }
 
-unsafe extern "system" fn toolbar_proc(
+unsafe extern "system" fn button_proc(
     hwnd: HWND,
     message: u32,
     w: WPARAM,
@@ -769,7 +864,7 @@ unsafe extern "system" fn toolbar_proc(
     unsafe {
         match message {
             WM_MOUSEMOVE => {
-                let previous = HOT_TOOL.with(|hot| hot.replace(hwnd));
+                let previous = HOT_BUTTON.with(|hot| hot.replace(hwnd));
                 if previous != hwnd {
                     if !previous.is_null() {
                         InvalidateRect(previous, null(), 0);
@@ -785,17 +880,50 @@ unsafe extern "system" fn toolbar_proc(
                 }
             }
             WM_MOUSELEAVE | WM_NCDESTROY => {
-                if HOT_TOOL.with(Cell::get) == hwnd {
-                    HOT_TOOL.with(|hot| hot.set(null_mut()));
+                if HOT_BUTTON.with(Cell::get) == hwnd {
+                    HOT_BUTTON.with(|hot| hot.set(null_mut()));
                     InvalidateRect(hwnd, null(), 0);
                 }
                 if message == WM_NCDESTROY {
-                    RemoveWindowSubclass(hwnd, Some(toolbar_proc), 3);
+                    RemoveWindowSubclass(hwnd, Some(button_proc), 3);
                 }
+            }
+            WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
+                InvalidateRect(hwnd, null(), 0);
             }
             _ => {}
         }
         DefSubclassProc(hwnd, message, w, l)
+    }
+}
+
+unsafe extern "system" fn field_proc(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        let result = DefSubclassProc(hwnd, message, w, l);
+        match message {
+            WM_NCPAINT | WM_PAINT => {
+                if let Err(error) = controls::draw_field_border(hwnd, COLORS.with(Cell::get))
+                    && !ICON_ERROR_REPORTED.with(|reported| reported.replace(true))
+                {
+                    queue(Event::RenderError(error));
+                }
+            }
+            WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE | WM_THEMECHANGED => {
+                RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_FRAME);
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(field_proc), 6);
+            }
+            _ => {}
+        }
+        result
     }
 }
 
@@ -820,6 +948,45 @@ unsafe extern "system" fn map_proc(
     }
 }
 
+unsafe extern "system" fn results_divider_proc(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        match message {
+            WM_SETCURSOR => {
+                SetCursor(LoadCursorW(null_mut(), IDC_SIZENS));
+                return 1;
+            }
+            WM_LBUTTONDOWN => {
+                SetCapture(hwnd);
+                return 0;
+            }
+            WM_MOUSEMOVE if GetCapture() == hwnd => {
+                let mut point = POINT {
+                    x: l as i16 as i32,
+                    y: (l >> 16) as i16 as i32,
+                };
+                MapWindowPoints(hwnd, GetParent(hwnd), &mut point, 1);
+                queue(Event::ResultsResize(point.y));
+                return 0;
+            }
+            WM_LBUTTONUP if GetCapture() == hwnd => {
+                ReleaseCapture();
+                return 0;
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(results_divider_proc), 5);
+            }
+            _ => {}
+        }
+        DefSubclassProc(hwnd, message, w, l)
+    }
+}
 unsafe extern "system" fn tab_proc(
     hwnd: HWND,
     message: u32,
@@ -982,6 +1149,7 @@ struct Document {
 }
 
 struct SearchBar {
+    labels: [HWND; 3],
     query: HWND,
     replace: HWND,
     mode: HWND,
@@ -989,6 +1157,45 @@ struct SearchBar {
     word: HWND,
     buttons: Vec<HWND>,
     visible: bool,
+}
+
+struct SearchTask {
+    rx: mpsc::Receiver<Result<SearchResults>>,
+    cancelled: Arc<AtomicBool>,
+    discard: bool,
+}
+impl Drop for SearchTask {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+struct ResultPanel {
+    editor: Editor,
+    title: HWND,
+    divider: HWND,
+    buttons: Vec<HWND>,
+    visible: bool,
+    height: i32,
+    data: Option<SearchResults>,
+    links: Vec<ResultLink>,
+    current: Option<usize>,
+    job: Option<SearchTask>,
+}
+impl ResultPanel {
+    fn new(editor: Editor) -> Self {
+        Self {
+            editor,
+            title: null_mut(),
+            divider: null_mut(),
+            buttons: Vec::new(),
+            visible: false,
+            height: 230,
+            data: None,
+            links: Vec::new(),
+            current: None,
+            job: None,
+        }
+    }
 }
 
 struct CompareResult {
@@ -1021,6 +1228,7 @@ struct App {
     tools: Vec<HWND>,
     tooltips: Option<Tooltips>,
     search: SearchBar,
+    results: ResultPanel,
     tree: HWND,
     documents: Vec<Document>,
     languages: Vec<Language>,
@@ -1032,6 +1240,7 @@ struct App {
     palette: Palette,
     theme: String,
     editor_font: EditorFont,
+    show_symbols: ShowSymbols,
     font: HFONT,
     dpi: u32,
     map_visible: bool,
@@ -1089,12 +1298,28 @@ impl App {
         Ok(hwnd)
     }
     fn button(&self, title: &str, id: usize) -> Result<HWND> {
-        self.control(
+        let button = self.control(
             "BUTTON",
             title,
             WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW as u32,
             id,
-        )
+        )?;
+        if unsafe { SetWindowSubclass(button, Some(button_proc), 3, 0) } == 0 {
+            return Err("Could not initialize button interaction.".into());
+        }
+        Ok(button)
+    }
+    fn search_field(&self, id: usize) -> Result<HWND> {
+        let field = self.control(
+            "EDIT",
+            "",
+            WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+            id,
+        )?;
+        if unsafe { SetWindowSubclass(field, Some(field_proc), 6, 0) } == 0 {
+            return Err("Could not initialize the search-field border.".into());
+        }
+        Ok(field)
     }
     fn index(&self) -> usize {
         if self.focused == 1 {
@@ -1145,16 +1370,16 @@ impl App {
         for button in &TOOLBAR {
             let control = self.button(button.name, button.command)?;
             unsafe {
-                if SetWindowSubclass(control, Some(toolbar_proc), 3, 0) == 0 {
-                    return Err("Could not initialize toolbar interaction.".into());
-                }
                 tooltips.add(control, button.tooltip)?;
             }
             self.tools.push(control);
         }
         self.tooltips = Some(tooltips);
-        self.search.query = self.control("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL as u32, 401)?;
-        self.search.replace = self.control("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL as u32, 402)?;
+        self.search.labels[0] = self.control("STATIC", "Find:", SS_CENTERIMAGE, 406)?;
+        self.search.query = self.search_field(401)?;
+        self.search.labels[1] = self.control("STATIC", "Replace:", SS_CENTERIMAGE, 407)?;
+        self.search.replace = self.search_field(402)?;
+        self.search.labels[2] = self.control("STATIC", "Mode:", SS_CENTERIMAGE, 408)?;
         self.search.mode =
             self.control("COMBOBOX", "", WS_TABSTOP | CBS_DROPDOWNLIST as u32, 403)?;
         for name in ["Normal", "Extended (\\n, \\t)", "Regex ($1 captures)"] {
@@ -1184,6 +1409,7 @@ impl App {
             SendMessageW(self.search.query, EM_SETLIMITTEXT, 32768, 0);
             SendMessageW(self.search.replace, EM_SETLIMITTEXT, 32768, 0);
         }
+        self.set_search_margins();
         self.search.case = self.control(
             "BUTTON",
             "Match case",
@@ -1202,10 +1428,35 @@ impl App {
             ("Replace", REPLACE),
             ("Replace all", REPLACE_ALL),
             ("Close", SEARCH_CLOSE),
+            ("Find all: current document", FIND_ALL_CURRENT),
+            ("Find all: all open documents", FIND_ALL_OPEN),
         ]
         .into_iter()
         .map(|(label, id)| self.button(label, id))
         .collect::<Result<_>>()?;
+        self.results.title =
+            self.control("STATIC", "Search results", WS_VISIBLE | SS_CENTERIMAGE, 305)?;
+        self.results.divider =
+            self.control("STATIC", "", WS_VISIBLE | SS_NOTIFY, RESULTS_DIVIDER_ID)?;
+        unsafe {
+            if SetWindowSubclass(self.results.divider, Some(results_divider_proc), 5, 0) == 0 {
+                return Err("Could not create the search-results resize divider.".into());
+            }
+        }
+        self.results.buttons = [
+            ("Previous", RESULTS_PREVIOUS),
+            ("Next", RESULTS_NEXT),
+            ("Cancel", RESULTS_CANCEL),
+            ("Clear", RESULTS_CLEAR),
+            ("Close", RESULTS_CLOSE),
+        ]
+        .into_iter()
+        .map(|(label, id)| self.button(label, id))
+        .collect::<Result<_>>()?;
+        self.results.editor.set_read_only_text("Use Find All to list matches in the current document or all open tabs.\nDouble-click a result or press Enter to navigate. F4 / Shift+F4: next / previous match.")?;
+        unsafe {
+            EnableWindow(self.results.buttons[2], 0);
+        }
         self.make_menu()?;
         Ok(())
     }
@@ -1258,6 +1509,18 @@ impl App {
                         (FIND_NEXT, "Find next\tF3"),
                         (FIND_PREVIOUS, "Find previous\tShift+F3"),
                         (REPLACE_ALL, "Replace all"),
+                        (
+                            FIND_ALL_CURRENT,
+                            "Find all in current document\tCtrl+Alt+Enter",
+                        ),
+                        (
+                            FIND_ALL_OPEN,
+                            "Find all in all open documents\tCtrl+Shift+Enter",
+                        ),
+                        (0, ""),
+                        (RESULTS_TOGGLE, "Search results panel\tCtrl+Alt+R"),
+                        (RESULTS_NEXT, "Next search result\tF4"),
+                        (RESULTS_PREVIOUS, "Previous search result\tShift+F4"),
                     ],
                 ),
                 (
@@ -1296,6 +1559,21 @@ impl App {
                 }
                 menu_item(bar, menu as usize, label, true, true);
             }
+            let view = GetSubMenu(bar, 3);
+            let symbols = new_menu(true);
+            for (id, label) in [
+                (SYMBOL_SPACE, "Show space and tab"),
+                (SYMBOL_EOL, "Show end of line"),
+                (SYMBOL_NONPRINTING, "Show non-printing characters"),
+                (SYMBOL_CONTROLS, "Show control characters && Unicode EOL"),
+                (SYMBOL_ALL, "Show all characters"),
+                (0, ""),
+                (SYMBOL_INDENT, "Show indent guide"),
+                (SYMBOL_WRAP, "Show wrap symbol"),
+            ] {
+                menu_item(symbols, id, label, false, false);
+            }
+            menu_item(view, symbols as usize, "Show &symbols", true, false);
             let edit = GetSubMenu(bar, 1);
             let cases = new_menu(true);
             for (id, label) in [
@@ -1447,7 +1725,35 @@ impl App {
             menu_item(bar, help as usize, "&Help", true, true);
             SetMenu(self.hwnd, bar);
         }
+        self.update_symbol_checks();
         Ok(())
+    }
+    fn update_symbol_checks(&self) {
+        unsafe {
+            let menu = GetMenu(self.hwnd);
+            for (id, checked) in [
+                (SYMBOL_SPACE, self.show_symbols.whitespace),
+                (SYMBOL_EOL, self.show_symbols.eol),
+                (SYMBOL_NONPRINTING, self.show_symbols.non_printing),
+                (SYMBOL_CONTROLS, self.show_symbols.controls),
+                (SYMBOL_ALL, self.show_symbols.all_characters()),
+                (SYMBOL_INDENT, self.show_symbols.indent_guides),
+                (SYMBOL_WRAP, self.show_symbols.wrap_markers),
+            ] {
+                CheckMenuItem(
+                    menu,
+                    id as u32,
+                    MF_BYCOMMAND | if checked { MF_CHECKED } else { MF_UNCHECKED },
+                );
+            }
+            DrawMenuBar(self.hwnd);
+        }
+    }
+    fn apply_symbols(&self) {
+        for editor in self.editors {
+            editor.show_symbols(self.show_symbols, self.palette);
+        }
+        self.update_symbol_checks();
     }
     fn apply_theme(&mut self) {
         self.palette = Palette::new(match self.theme.as_str() {
@@ -1459,6 +1765,13 @@ impl App {
         unsafe {
             PANEL_BRUSH.with(|b| {
                 let previous = b.replace(CreateSolidBrush(self.palette.panel));
+                if !previous.is_null() {
+                    DeleteObject(previous);
+                }
+            });
+            FIELD_BRUSH.with(|brush| {
+                let previous =
+                    brush.replace(CreateSolidBrush(controls::Colors::new(self.palette).field));
                 if !previous.is_null() {
                     DeleteObject(previous);
                 }
@@ -1526,8 +1839,12 @@ impl App {
                 null_mut(),
                 RDW_INVALIDATE | RDW_ALLCHILDREN,
             );
+            for field in [self.search.query, self.search.replace] {
+                RedrawWindow(field, null(), null_mut(), RDW_INVALIDATE | RDW_FRAME);
+            }
         }
         self.apply_editor_styles();
+        self.theme_results();
     }
     fn apply_editor_styles(&self) {
         if self.documents.is_empty() {
@@ -1543,6 +1860,7 @@ impl App {
                 &self.editor_font,
             );
         }
+        self.apply_symbols();
         self.configure_map();
     }
     fn set_editor_font(&mut self, selection: Option<EditorFont>) {
@@ -1591,21 +1909,38 @@ impl App {
                 self.search.mode,
                 self.search.case,
                 self.search.word,
+                self.results.title,
             ];
             controls.extend(&self.tools);
+            controls.extend(self.search.labels);
             if let Some(tooltips) = &self.tooltips {
                 controls.push(tooltips.hwnd);
             }
             controls.extend(&self.search.buttons);
+            controls.extend(&self.results.buttons);
             for control in controls {
                 unsafe {
                     SendMessageW(control, WM_SETFONT, font as usize, 1);
                 }
+                self.set_search_margins();
             }
         }
         if !old.is_null() {
             unsafe {
                 DeleteObject(old);
+            }
+        }
+    }
+    fn set_search_margins(&self) {
+        let margin = self.scale(8).max(1) as usize;
+        for field in [self.search.query, self.search.replace] {
+            unsafe {
+                SendMessageW(
+                    field,
+                    EM_SETMARGINS,
+                    (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
+                    (margin | (margin << 16)) as isize,
+                );
             }
         }
     }
@@ -1616,14 +1951,23 @@ impl App {
             let (width, height) = (rect.right, rect.bottom);
             let toolbar_h = self.scale(42);
             let tab_h = self.scale(37);
+            let search_layout = SearchLayout::new(width, self.dpi);
             let search_h = if self.search.visible {
-                self.scale(82)
+                search_layout.height
             } else {
                 0
             };
             let status_h = self.scale(28);
             let top = toolbar_h + tab_h + search_h;
-            let body_h = (height - top - status_h).max(1);
+            let available_h = (height - top - status_h).max(1);
+            let results_h = if self.results.visible {
+                self.scale(self.results.height)
+                    .min((available_h - self.scale(100)).max(0))
+                    .max(0)
+            } else {
+                0
+            };
+            let body_h = (available_h - results_h).max(1);
             let tree_w = if self.tree_visible {
                 self.scale(280).min(width / 3)
             } else {
@@ -1684,65 +2028,79 @@ impl App {
                 self.map.hwnd,
                 if self.map_visible { SW_SHOWNA } else { SW_HIDE },
             );
-            let y = toolbar_h + tab_h + self.scale(6);
-            let input_w = (width / 3).max(self.scale(180));
+            let panel_top = top + body_h;
+            let divider_h = self.scale(5);
+            let header_h = self.scale(32);
+            MoveWindow(self.results.divider, 0, panel_top, width, divider_h, 1);
             MoveWindow(
-                self.search.query,
-                self.scale(12),
-                y,
-                input_w,
-                self.scale(28),
+                self.results.title,
+                self.scale(10),
+                panel_top + divider_h,
+                (width - self.scale(420)).max(1),
+                header_h,
                 1,
             );
-            MoveWindow(
-                self.search.replace,
-                self.scale(12),
-                y + self.scale(35),
-                input_w,
-                self.scale(28),
-                1,
-            );
-            let mode_x = input_w + self.scale(24);
-            MoveWindow(
-                self.search.mode,
-                mode_x,
-                y,
-                self.scale(180),
-                self.scale(180),
-                1,
-            );
-            MoveWindow(
-                self.search.case,
-                mode_x,
-                y + self.scale(35),
-                self.scale(108),
-                self.scale(28),
-                1,
-            );
-            MoveWindow(
-                self.search.word,
-                mode_x + self.scale(110),
-                y + self.scale(35),
-                self.scale(116),
-                self.scale(28),
-                1,
-            );
-            for (i, button) in self.search.buttons.iter().enumerate() {
-                let (x, row) = match i {
-                    0 => (mode_x + self.scale(190), 0),
-                    1 => (mode_x + self.scale(270), 0),
-                    2 => (mode_x + self.scale(240), 1),
-                    3 => (mode_x + self.scale(320), 1),
-                    _ => (width - self.scale(70), 0),
-                };
+            for (index, button) in self.results.buttons.iter().enumerate() {
                 MoveWindow(
                     *button,
-                    x,
-                    y + row * self.scale(35),
-                    self.scale(if i == 3 { 96 } else { 76 }),
+                    width - self.scale(400 - index as i32 * 78),
+                    panel_top + divider_h + self.scale(2),
+                    self.scale(74),
                     self.scale(28),
                     1,
                 );
+            }
+            MoveWindow(
+                self.results.editor.hwnd,
+                0,
+                panel_top + divider_h + header_h,
+                width,
+                (results_h - divider_h - header_h).max(1),
+                1,
+            );
+            for control in [
+                self.results.divider,
+                self.results.title,
+                self.results.editor.hwnd,
+            ]
+            .into_iter()
+            .chain(self.results.buttons.iter().copied())
+            {
+                ShowWindow(
+                    control,
+                    if self.results.visible {
+                        SW_SHOWNA
+                    } else {
+                        SW_HIDE
+                    },
+                );
+            }
+            let y = toolbar_h + tab_h;
+            let place = |hwnd, bounds: controls::Bounds| {
+                MoveWindow(hwnd, bounds.x, y + bounds.y, bounds.width, bounds.height, 1);
+            };
+            for (hwnd, bounds) in self.search.labels.into_iter().zip(search_layout.labels) {
+                place(hwnd, bounds);
+            }
+            for (index, (hwnd, mut bounds)) in
+                [self.search.query, self.search.replace, self.search.mode]
+                    .into_iter()
+                    .zip(search_layout.fields)
+                    .enumerate()
+            {
+                if index == 2 {
+                    bounds.height = self.scale(180);
+                }
+                place(hwnd, bounds);
+            }
+            for (hwnd, bounds) in [self.search.case, self.search.word]
+                .into_iter()
+                .zip(search_layout.checks)
+            {
+                place(hwnd, bounds);
+            }
+            for (hwnd, bounds) in self.search.buttons.iter().zip(search_layout.buttons) {
+                place(*hwnd, bounds);
             }
             for control in [
                 self.search.query,
@@ -1752,6 +2110,7 @@ impl App {
                 self.search.word,
             ]
             .into_iter()
+            .chain(self.search.labels)
             .chain(self.search.buttons.iter().copied())
             {
                 ShowWindow(
@@ -1853,6 +2212,7 @@ impl App {
                 self.editors[pane].send(SCI_SETWRAPMODE, self.wrap as usize, 0);
             }
         }
+        self.apply_symbols();
         self.configure_map();
         self.layout();
         Ok(())
@@ -1953,6 +2313,10 @@ impl App {
         let editor = self.editor();
         let line = editor.send(SCI_LINEFROMPOSITION, editor.position(), 0) + 1;
         let column = editor.send(SCI_GETCOLUMN, editor.position(), 0) + 1;
+        let characters = match editor.character_counts() {
+            Ok(counts) => counts.to_string(),
+            Err(error) => format!("Character count unavailable: {error}"),
+        };
         let state = if self.recovery_error.is_some() {
             "RECOVERY FAILED"
         } else if self.recovery_busy {
@@ -1970,7 +2334,7 @@ impl App {
         set_text(
             self.status,
             &format!(
-                "Ln {line}, Col {column}   |   {} selections   |   {}   |   {}   {}   |   {state}   {}",
+                "Ln {line}, Col {column}   |   {characters}   |   {} selections   |   {}   |   {}   {}   |   {state}   {}",
                 editor.send(SCI_GETSELECTIONS, 0, 0),
                 self.languages[doc.language].name,
                 doc.snapshot.encoding.label(),
@@ -2169,7 +2533,18 @@ impl App {
         if self.documents.len() == 1 {
             self.new_document()?;
         }
-        self.documents.remove(index);
+        let closed = self.documents.remove(index);
+        if self.results.data.as_ref().is_some_and(|results| {
+            results
+                .files
+                .iter()
+                .any(|file| file.id == closed.snapshot.id)
+        }) {
+            set_text(
+                self.results.title,
+                "A result document was closed - rerun Find All to refresh.",
+            );
+        }
         self.primary = if self.primary > index {
             self.primary - 1
         } else {
@@ -2220,6 +2595,7 @@ impl App {
             active: self.index(),
             theme: self.theme.clone(),
             editor_font: self.editor_font.clone(),
+            show_symbols: self.show_symbols,
             custom_languages: self
                 .languages
                 .iter()
@@ -2337,6 +2713,309 @@ impl App {
             self.find(false)?;
         }
         Ok(())
+    }
+    fn theme_results(&self) {
+        let editor = self.results.editor;
+        editor.theme(&self.languages[0], self.palette);
+        editor.send(SCI_SETMARGINWIDTHN, 0, 0);
+        editor.send(SCI_SETMARGINWIDTHN, 1, 0);
+        editor.send(SCI_SETWRAPMODE, 0, 0);
+        editor.send(SCI_SETCARETLINEVISIBLE, 1, 0);
+        editor.send(SCI_STYLESETFORE, 1, self.palette.accent as isize);
+        editor.send(SCI_STYLESETBOLD, 1, 1);
+        editor.send(SCI_STYLESETBOLD, 2, 1);
+        editor.send(SCI_INDICSETSTYLE, search_results::MATCH_INDICATOR, 7);
+        editor.send(
+            SCI_INDICSETFORE,
+            search_results::MATCH_INDICATOR,
+            self.palette.accent as isize,
+        );
+        editor.send(SCI_INDICSETALPHA, search_results::MATCH_INDICATOR, 75);
+        editor.send(
+            SCI_INDICSETOUTLINEALPHA,
+            search_results::MATCH_INDICATOR,
+            140,
+        );
+        editor.send(SCI_INDICSETUNDER, search_results::MATCH_INDICATOR, 1);
+    }
+    fn result_message(&mut self, message: &str) {
+        set_text(self.results.title, message);
+        self.note(message);
+    }
+    fn update_result_buttons(&self) {
+        unsafe {
+            let has_results = !self.results.links.is_empty();
+            for (index, button) in self.results.buttons.iter().enumerate() {
+                let enabled = match index {
+                    0 | 1 => has_results,
+                    2 => self.results.job.is_some(),
+                    _ => true,
+                };
+                EnableWindow(*button, enabled as i32);
+            }
+            for button in self.search.buttons.iter().skip(5) {
+                EnableWindow(*button, self.results.job.is_none() as i32);
+            }
+        }
+    }
+    fn start_find_all(&mut self, all_open: bool) -> Result<()> {
+        if self.results.job.is_some() {
+            self.results.visible = true;
+            self.layout();
+            self.note("Find All is still running. Cancel it before starting another search.");
+            return Ok(());
+        }
+        if window_text(self.search.query).is_empty() {
+            self.show_search()?;
+            if window_text(self.search.query).is_empty() {
+                self.note("Enter a search expression, then choose Find All.");
+                return Ok(());
+            }
+        }
+        let query = window_text(self.search.query);
+        let search = self.search_settings()?;
+        let mut bytes = 0usize;
+        let mut inputs = Vec::new();
+        for (index, doc) in self.documents.iter().enumerate() {
+            if !all_open && index != self.index() {
+                continue;
+            }
+            self.scratch.attach(&doc.handle);
+            let length = self.scratch.length();
+            if length > core::MAX_TOOL_BYTES {
+                return Err(format!(
+                    "{} exceeds the 16 MiB search limit. No documents were skipped or searched.",
+                    doc.snapshot.title
+                ));
+            }
+            bytes += length;
+            if bytes > search_results::MAX_BATCH_BYTES {
+                return Err("Find All is limited to 64 MiB across open documents. Close some tabs or search the current document.".into());
+            }
+            let title = doc
+                .snapshot
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| doc.snapshot.title.clone());
+            inputs.push(SearchInput {
+                id: doc.snapshot.id,
+                revision: doc.revision,
+                title,
+                text: self.scratch.text()?,
+                tab_width: self.scratch.send(SCI_GETTABWIDTH, 0, 0).max(1) as usize,
+            });
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = cancelled.clone();
+        let (tx, rx) = mpsc::channel();
+        self.results
+            .editor
+            .set_read_only_text("Searching open document snapshots...\n")?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        self.results.data = None;
+        self.results.links.clear();
+        self.results.current = None;
+        self.results.visible = true;
+        std::thread::spawn(move || {
+            let result = search_results::find_all(&search, query, inputs, &token);
+            let _ = tx.send(result);
+        });
+        self.results.job = Some(SearchTask {
+            rx,
+            cancelled,
+            discard: false,
+        });
+        self.result_message(if all_open {
+            "Searching all open documents..."
+        } else {
+            "Searching current document..."
+        });
+        self.update_result_buttons();
+        self.layout();
+        Ok(())
+    }
+    fn apply_find_results(&mut self, results: SearchResults) -> Result<()> {
+        let rendered = results.render();
+        self.results.editor.set_read_only_text(&rendered.text)?;
+        self.theme_results();
+        self.results.editor.highlight(&rendered.highlight)?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        for range in rendered.emphasis {
+            self.results
+                .editor
+                .indicator(search_results::MATCH_INDICATOR, range)?;
+        }
+        self.results.links = rendered.links;
+        self.results.current = None;
+        let stale = results.files.iter().any(|file| {
+            !self
+                .documents
+                .iter()
+                .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+        });
+        let summary = results.summary()
+            + if stale {
+                " - some documents changed; rerun to navigate those matches."
+            } else {
+                " - double-click or Enter to navigate."
+            };
+        self.results.data = Some(results);
+        self.result_message(&summary);
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn clear_find_results(&mut self) -> Result<()> {
+        if let Some(job) = &mut self.results.job {
+            job.cancelled.store(true, Ordering::Relaxed);
+            job.discard = true;
+        }
+        self.results
+            .editor
+            .set_read_only_text("Search results cleared. Run Find All to search again.\n")?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        self.results.data = None;
+        self.results.links.clear();
+        self.results.current = None;
+        self.result_message("Search results cleared.");
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn activate_result(&mut self, index: usize) -> Result<()> {
+        let Some(link) = self.results.links.get(index) else {
+            return Ok(());
+        };
+        let Some(results) = &self.results.data else {
+            return Ok(());
+        };
+        let file = &results.files[link.file];
+        let Some(document) = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == file.id)
+        else {
+            self.result_message("This result's document was closed. Run Find All again.");
+            return Ok(());
+        };
+        if self.documents[document].revision != file.revision {
+            self.result_message("This document changed since the search. Run Find All again before navigating its results.");
+            return Ok(());
+        }
+        let range = file.hits[link.hit].range.clone();
+        let row = link.row;
+        // A compare binds two particular documents; do not silently change its pair.
+        if self.comparing && document != self.index() {
+            self.clear_compare();
+        }
+        if document != self.index() {
+            self.switch(document)?;
+        }
+        self.editor().select(range);
+        self.editor().focus();
+        self.results.current = Some(index);
+        let editor = self.results.editor;
+        editor.send(SCI_ENSUREVISIBLEENFORCEPOLICY, row, 0);
+        let start = editor.send(SCI_POSITIONFROMLINE, row, 0).max(0) as usize;
+        let end = editor
+            .send(SCI_GETLINEENDPOSITION, row, 0)
+            .max(start as isize) as usize;
+        editor.select(start..end);
+        self.results.visible = true;
+        self.layout();
+        self.result_message(&format!(
+            "Search result {} of {} (F4 / Shift+F4)",
+            index + 1,
+            self.results.links.len()
+        ));
+        Ok(())
+    }
+    fn activate_result_row(&mut self) -> Result<()> {
+        let editor = self.results.editor;
+        let row = editor.send(SCI_LINEFROMPOSITION, editor.position(), 0) as usize;
+        if let Some(index) = self.results.links.iter().position(|link| link.row == row) {
+            self.activate_result(index)?;
+        } else {
+            editor.send(SCI_TOGGLEFOLD, row, 0);
+        }
+        Ok(())
+    }
+    fn next_result(&mut self, previous: bool) -> Result<()> {
+        let count = self.results.links.len();
+        if count == 0 {
+            self.results.visible = true;
+            self.layout();
+            self.note("No search matches are listed. Run Find All first.");
+            return Ok(());
+        }
+        let index = match (self.results.current, previous) {
+            (None, false) => 0,
+            (None, true) => count - 1,
+            (Some(index), false) => (index + 1) % count,
+            (Some(index), true) => (index + count - 1) % count,
+        };
+        let valid = (0..count)
+            .map(|step| {
+                if previous {
+                    (index + count - step) % count
+                } else {
+                    (index + step) % count
+                }
+            })
+            .find(|candidate| {
+                let Some(results) = &self.results.data else {
+                    return false;
+                };
+                let file = &results.files[self.results.links[*candidate].file];
+                self.documents
+                    .iter()
+                    .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+            });
+        self.activate_result(valid.unwrap_or(index))
+    }
+    fn poll_find_results(&mut self) -> Result<()> {
+        let Some(job) = &self.results.job else {
+            return Ok(());
+        };
+        let result = match job.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("Find All worker stopped unexpectedly.".into()))
+            }
+        };
+        let Some(result) = result else {
+            return Ok(());
+        };
+        let job = self.results.job.take().expect("active search task");
+        let cancelled = job.cancelled.load(Ordering::Relaxed);
+        let applied = (|| -> Result<()> {
+            if !job.discard {
+                match result {
+                    Ok(results) if !cancelled => self.apply_find_results(results)?,
+                    Ok(_) => {
+                        self.results
+                            .editor
+                            .set_read_only_text("Search cancelled.\n")?;
+                        self.result_message("Search cancelled.");
+                    }
+                    Err(error) => {
+                        self.results
+                            .editor
+                            .set_read_only_text(&format!("Find All: {error}\n"))?;
+                        self.result_message(&error);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.update_result_buttons();
+        applied
     }
     fn clear_compare(&mut self) {
         for doc in &self.documents {
@@ -2742,7 +3421,49 @@ impl App {
         Ok(())
     }
     fn command(&mut self, command: usize) -> Result<()> {
-        let editor = self.editor();
+        let results_focused = unsafe { GetFocus() } == self.results.editor.hwnd;
+        if results_focused
+            && matches!(
+                command,
+                UNDO | REDO
+                    | CUT
+                    | PASTE
+                    | DUPLICATE
+                    | DELETE_LINE
+                    | UPPER
+                    | LOWER
+                    | TITLE_CASE
+                    | SENTENCE_CASE
+                    | INVERT_CASE
+                    | SORT
+                    | SORT_DESC
+                    | UNIQUE
+                    | TRIM
+                    | REMOVE_EMPTY
+                    | SORT_IGNORE_CASE
+                    | SORT_DESC_IGNORE_CASE
+                    | SORT_NATURAL
+                    | SORT_NUMERIC
+                    | SORT_NUMERIC_DESC
+                    | SORT_NUMERIC_COMMA
+                    | REVERSE_LINES
+                    | UNIQUE_ADJACENT
+                    | TRIM_START
+                    | TRIM_BOTH
+                    | REMOVE_EMPTY_ONLY
+                    | JOIN_LINES
+                    | ADD_NEXT
+                    | SELECT_MATCHES
+            )
+        {
+            self.note("Search results are read-only. Focus an editing pane to modify a document.");
+            return Ok(());
+        }
+        let editor = if results_focused && matches!(command, COPY | SELECT_ALL) {
+            self.results.editor
+        } else {
+            self.editor()
+        };
         match command {
             NEW => self.new_document()?,
             OPEN => {
@@ -2827,6 +3548,31 @@ impl App {
             }
             FIND_NEXT => self.find(false)?,
             FIND_PREVIOUS => self.find(true)?,
+            FIND_ALL_CURRENT => self.start_find_all(false)?,
+            FIND_ALL_OPEN => self.start_find_all(true)?,
+            RESULTS_TOGGLE => {
+                self.results.visible = !self.results.visible;
+                self.layout();
+                if self.results.visible {
+                    self.results.editor.focus();
+                } else {
+                    self.editor().focus();
+                }
+            }
+            RESULTS_NEXT => self.next_result(false)?,
+            RESULTS_PREVIOUS => self.next_result(true)?,
+            RESULTS_CLEAR => self.clear_find_results()?,
+            RESULTS_CLOSE => {
+                self.results.visible = false;
+                self.layout();
+                self.editor().focus();
+            }
+            RESULTS_CANCEL => {
+                if let Some(job) = &self.results.job {
+                    job.cancelled.store(true, Ordering::Relaxed);
+                    self.result_message("Cancelling search...");
+                }
+            }
             REPLACE => self.replace(false)?,
             REPLACE_ALL => self.replace(true)?,
             SPLIT => {
@@ -2855,6 +3601,25 @@ impl App {
                 for ed in self.editors {
                     ed.send(SCI_SETWRAPMODE, self.wrap as usize, 0);
                 }
+            }
+            SYMBOL_SPACE | SYMBOL_EOL | SYMBOL_NONPRINTING | SYMBOL_CONTROLS | SYMBOL_ALL
+            | SYMBOL_INDENT | SYMBOL_WRAP => {
+                match command {
+                    SYMBOL_SPACE => self.show_symbols.whitespace = !self.show_symbols.whitespace,
+                    SYMBOL_EOL => self.show_symbols.eol = !self.show_symbols.eol,
+                    SYMBOL_NONPRINTING => {
+                        self.show_symbols.non_printing = !self.show_symbols.non_printing
+                    }
+                    SYMBOL_CONTROLS => self.show_symbols.controls = !self.show_symbols.controls,
+                    SYMBOL_ALL => self.show_symbols.toggle_all(),
+                    SYMBOL_INDENT => {
+                        self.show_symbols.indent_guides = !self.show_symbols.indent_guides
+                    }
+                    SYMBOL_WRAP => self.show_symbols.wrap_markers = !self.show_symbols.wrap_markers,
+                    _ => unreachable!(),
+                }
+                self.apply_symbols();
+                self.touch();
             }
             ZOOM_RESET => {
                 for ed in self.editors {
@@ -2992,6 +3757,17 @@ impl App {
         let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
         let alt = unsafe { GetKeyState(VK_MENU as i32) } < 0;
         let key = message.wParam as u16;
+        let result_focus = unsafe { GetFocus() } == self.results.editor.hwnd;
+        if result_focus && !control && !alt {
+            if key == VK_RETURN {
+                self.activate_result_row()?;
+                return Ok(true);
+            }
+            if key == VK_ESCAPE {
+                self.command(RESULTS_CLOSE)?;
+                return Ok(true);
+            }
+        }
         let command = match (control, shift, alt, key) {
             (true, false, false, 0x4e) => Some(NEW),
             (true, false, false, 0x4f) => Some(OPEN),
@@ -3008,6 +3784,11 @@ impl App {
             (true, false, true, VK_RIGHT) => Some(SPLIT),
             (false, false, false, VK_F3) => Some(FIND_NEXT),
             (false, true, false, VK_F3) => Some(FIND_PREVIOUS),
+            (false, false, false, VK_F4) => Some(RESULTS_NEXT),
+            (false, true, false, VK_F4) => Some(RESULTS_PREVIOUS),
+            (true, false, true, VK_RETURN) => Some(FIND_ALL_CURRENT),
+            (true, true, false, VK_RETURN) => Some(FIND_ALL_OPEN),
+            (true, false, true, 0x52) => Some(RESULTS_TOGGLE),
             (false, false, false, VK_F7) => Some(DIFF_NEXT),
             (false, true, false, VK_F7) => Some(DIFF_PREVIOUS),
             (false, false, false, VK_ESCAPE) if self.search.visible => Some(SEARCH_CLOSE),
@@ -3053,6 +3834,7 @@ impl App {
         Ok(false)
     }
     fn tick(&mut self) -> Result<()> {
+        self.poll_find_results()?;
         while let Ok((revision, result)) = self.recovery.rx.try_recv() {
             self.recovery_busy = false;
             match result {
@@ -3186,6 +3968,9 @@ impl App {
                 return Ok(());
             }
         }
+        if let Some(job) = &self.results.job {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
         self.exiting = true;
         self.documents.clear();
         unsafe {
@@ -3286,6 +4071,14 @@ impl App {
                 doc.snapshot.dirty = dirty;
                 doc.revision += 1;
                 doc.last_edit = Instant::now();
+                if self.results.data.as_ref().is_some_and(|results| {
+                    results.files.iter().any(|file| file.id == doc.snapshot.id)
+                }) {
+                    set_text(
+                        self.results.title,
+                        "Document changed - rerun Find All to refresh its results.",
+                    );
+                }
                 if self.json_document == Some(doc.snapshot.id) {
                     self.json_document = None;
                 }
@@ -3411,6 +4204,16 @@ impl App {
                     self.layout();
                 }
             }
+            Event::ResultActivate => self.activate_result_row()?,
+            Event::ResultsResize(y) => {
+                let mut rect: RECT = unsafe { zeroed() };
+                unsafe {
+                    GetClientRect(self.hwnd, &mut rect);
+                }
+                self.results.height =
+                    ((rect.bottom - self.scale(28) - y) * 96 / self.dpi.max(1) as i32).max(90);
+                self.layout();
+            }
         }
         Ok(())
     }
@@ -3491,6 +4294,11 @@ pub fn run() -> Result<()> {
         }
         COLORS.with(|c| c.set(Palette::new(false)));
         PANEL_BRUSH.with(|b| b.set(CreateSolidBrush(Palette::new(false).panel)));
+        FIELD_BRUSH.with(|b| {
+            b.set(CreateSolidBrush(
+                controls::Colors::new(Palette::new(false)).field,
+            ))
+        });
         let hwnd = CreateWindowExW(
             WS_EX_ACCEPTFILES,
             class.as_ptr(),
@@ -3512,6 +4320,7 @@ pub fn run() -> Result<()> {
         let secondary = Editor::new(hwnd, instance, 102, false)?;
         let scratch = Editor::new(hwnd, instance, 103, false)?;
         let map = Editor::new(hwnd, instance, 104, false)?;
+        let result_editor = Editor::new(hwnd, instance, RESULTS_EDITOR_ID, false)?;
         SetWindowSubclass(map.hwnd, Some(map_proc), 1, 0);
         RevokeDragDrop(map.hwnd);
         SetWindowLongPtrW(
@@ -3535,6 +4344,7 @@ pub fn run() -> Result<()> {
             tooltips: None,
             tree: null_mut(),
             search: SearchBar {
+                labels: [null_mut(); 3],
                 query: null_mut(),
                 replace: null_mut(),
                 mode: null_mut(),
@@ -3543,6 +4353,7 @@ pub fn run() -> Result<()> {
                 buttons: Vec::new(),
                 visible: false,
             },
+            results: ResultPanel::new(result_editor),
             documents: Vec::new(),
             languages,
             completion_api: session.completion_api,
@@ -3553,6 +4364,7 @@ pub fn run() -> Result<()> {
             palette: Palette::new(false),
             theme: session.theme.clone(),
             editor_font: session.editor_font,
+            show_symbols: session.show_symbols,
             font: null_mut(),
             dpi: GetDpiForWindow(hwnd),
             map_visible: false,
@@ -3647,6 +4459,7 @@ pub fn run() -> Result<()> {
             DeleteObject(app.font);
         }
         PANEL_BRUSH.with(|b| DeleteObject(b.replace(null_mut())));
+        FIELD_BRUSH.with(|b| DeleteObject(b.replace(null_mut())));
         Ok(())
     }
 }
