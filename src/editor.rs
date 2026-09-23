@@ -556,7 +556,7 @@ impl Editor {
     pub fn replace(self, range: Range<usize>, text: &str) -> Result<()> {
         self.validate_range(&range)?;
         if self.length().saturating_sub(range.len()) + text.len() > MAX_DOCUMENT_BYTES {
-            return Err("This edit would exceed the 128 MiB document limit.".into());
+            return Err("This edit would exceed the 256 MiB document limit.".into());
         }
         self.send(SCI_SETSTATUS, 0, 0);
         self.send(SCI_SETTARGETSTART, range.start, 0);
@@ -597,7 +597,7 @@ impl Editor {
             .iter()
             .fold(self.length(), |len, (r, s)| len - r.len() + s.len());
         if total > MAX_DOCUMENT_BYTES {
-            return Err("This edit would exceed 128 MiB.".into());
+            return Err("This edit would exceed 256 MiB.".into());
         }
         self.send(SCI_BEGINUNDOACTION, 0, 0);
         let result = edits
@@ -813,6 +813,14 @@ impl Editor {
                     rgb(221, 246, 230)
                 },
             ),
+            (
+                22,
+                if palette.dark {
+                    rgb(62, 50, 87)
+                } else {
+                    rgb(237, 224, 255)
+                },
+            ),
         ] {
             self.send(SCI_MARKERDEFINE, id, 22);
             self.send(SCI_MARKERSETBACK, id, color as isize);
@@ -827,6 +835,8 @@ impl Editor {
         self.send(SCI_CALLTIPSETBACK, palette.panel as usize, 0);
         self.send(SCI_CALLTIPSETFORE, palette.text as usize, 0);
         self.send(SCI_CALLTIPSETFOREHLT, palette.accent as usize, 0);
+        self.send(SCI_STYLESETBACK, 254, palette.background as isize);
+        self.send(SCI_STYLESETFORE, 254, palette.muted as isize);
         self.send(SCI_INDICSETSTYLE, crate::markdown::STRIKE_INDICATOR, 4);
         self.send(
             SCI_INDICSETFORE,
@@ -985,10 +995,43 @@ impl Editor {
         self.send(SCI_INDICATORCLEARRANGE, 0, self.length() as isize);
     }
     pub fn clear_diff(self) {
+        self.send(SCI_ANNOTATIONCLEARALL, 0, 0);
+        self.send(SCI_ANNOTATIONSETVISIBLE, 0, 0);
+        self.send(SCI_MARKERDELETEALL, 22, 0);
         for id in [20, 21] {
             self.send(SCI_MARKERDELETEALL, id, 0);
             self.clear_indicator(id);
         }
+    }
+    pub fn apply_compare_padding(self, padding: &[crate::comparison::Padding]) -> Result<usize> {
+        let total: usize = padding.iter().map(|pad| pad.count).sum();
+        if total > 20_000 {
+            return Err("Comparison has too many alignment spacer lines.".into());
+        }
+        self.send(SCI_ANNOTATIONCLEARALL, 0, 0);
+        self.send(SCI_ANNOTATIONSETVISIBLE, 1, 0);
+        let mut lines = std::collections::BTreeMap::<usize, usize>::new();
+        for pad in padding {
+            *lines.entry(pad.before).or_default() += pad.count;
+        }
+        let mut leading = 0;
+        for (before, count) in lines {
+            if count == 0 {
+                continue;
+            }
+            if before == 0 {
+                leading = count;
+            } else {
+                let line = (before - 1).min(self.send(SCI_GETLINECOUNT, 0, 0).max(1) as usize - 1);
+                let text =
+                    CString::new(format!("{} ", "\n".repeat(count - 1))).expect("spacer lines");
+                unsafe {
+                    self.send_raw(SCI_ANNOTATIONSETTEXT, line, text.as_ptr() as isize);
+                }
+                self.send(SCI_ANNOTATIONSETSTYLE, line, 254);
+            }
+        }
+        Ok(leading)
     }
     pub fn focus(self) {
         unsafe {

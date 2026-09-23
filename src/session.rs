@@ -8,6 +8,7 @@ use std::{
 };
 
 pub const SESSION_VERSION: u32 = 2;
+pub const MAX_RECOVERY_BYTES: usize = 512 * 1024 * 1024;
 
 pub fn default_directory(local_app_data: &Path) -> Result<PathBuf> {
     let current = local_app_data.join("rstpd");
@@ -40,6 +41,8 @@ pub struct DocumentSnapshot {
     pub dirty: bool,
     pub disk_hash: Option<u64>,
     pub caret: usize,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -52,10 +55,18 @@ pub struct Session {
     pub editor_font: EditorFont,
     #[serde(default)]
     pub show_symbols: crate::symbols::ShowSymbols,
+    #[serde(default = "monitor_enabled")]
+    pub monitor_files: bool,
+    #[serde(default)]
+    pub compare_options: crate::comparison::CompareOptions,
     #[serde(default)]
     pub custom_languages: Vec<crate::udl::UserLanguage>,
     #[serde(default)]
     pub completion_api: Vec<crate::completion::Api>,
+}
+
+fn monitor_enabled() -> bool {
+    true
 }
 
 /// FNV-1a (64-bit). Pinned on purpose: this value is written to `session.json` and
@@ -152,10 +163,11 @@ pub fn load(path: &Path) -> Result<Session> {
         return Ok(Session {
             version: SESSION_VERSION,
             theme: "system".into(),
+            monitor_files: true,
             ..Session::default()
         });
     }
-    let bytes = read_bounded(path, MAX_DOCUMENT_BYTES * 2)?;
+    let bytes = read_bounded(path, MAX_RECOVERY_BYTES)?;
     let session: Session = serde_json::from_slice(&bytes)
         .map_err(|e| format!("Recovery file is invalid; it has not been changed: {e}"))?;
     if !matches!(session.version, 1 | SESSION_VERSION) {
@@ -172,6 +184,7 @@ pub fn load(path: &Path) -> Result<Session> {
     if session.custom_languages.len() > 64 || session.completion_api.len() > 10_000 {
         return Err("Recovery language/completion definitions exceed their limits.".into());
     }
+    session.compare_options.validate()?;
     for language in &session.custom_languages {
         language.validate()?;
     }
@@ -193,9 +206,9 @@ pub fn save(path: &Path, session: &Session) -> Result<()> {
     struct BoundedOutput(Vec<u8>);
     impl Write for BoundedOutput {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.0.len() + bytes.len() > MAX_DOCUMENT_BYTES * 2 {
+            if self.0.len() + bytes.len() > MAX_RECOVERY_BYTES {
                 return Err(std::io::Error::other(
-                    "Recovery exceeds 256 MiB. Save and close some documents.",
+                    "Recovery exceeds 512 MiB. Save and close some documents.",
                 ));
             }
             self.0.extend_from_slice(bytes);
@@ -403,9 +416,20 @@ mod tests {
             dirty: true,
             disk_hash: None,
             caret: 3,
+            pinned: true,
         });
+        session.monitor_files = true;
+        session.compare_options.ignore_case = true;
+        session.compare_options.ignore_regex = r"\d+".into();
         save(&path, &session).unwrap();
         assert_eq!(load(&path).unwrap().documents[0].text, "unsaved\0text");
+        let restored = load(&path).unwrap();
+        assert!(
+            restored.documents[0].pinned
+                && restored.monitor_files
+                && restored.compare_options.ignore_case
+        );
+        assert_eq!(restored.compare_options.ignore_regex, r"\d+");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();

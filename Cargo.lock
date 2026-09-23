@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "rstpd"
-version = "1.1.2"
+version = "1.3.0"
 dependencies = [
  "cc",
  "embed-resource",

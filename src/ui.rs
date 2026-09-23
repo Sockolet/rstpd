@@ -1,4 +1,5 @@
 use crate::{
+    comparison::{self, CompareOptions, Comparison},
     completion::{self, Api},
     controls::{self, SearchLayout},
     core::{
@@ -6,10 +7,13 @@ use crate::{
         SearchMode,
     },
     editor::{self, DocumentHandle, Editor, Palette, sci::*},
+    folder_search::{self, FolderOptions},
     languages::{self, Language},
+    monitor::{self, Monitor},
     search_results::{self, Input as SearchInput, Link as ResultLink, Results as SearchResults},
     session::{self, DocumentSnapshot, RecoveryWorker, Session},
     symbols::ShowSymbols,
+    tabs,
     toolbar::{self, Icon, Tooltips},
     udl::{self, Highlight},
 };
@@ -32,7 +36,10 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::{Dwm::*, Gdi::*},
     System::{
+        Com::CoTaskMemFree,
+        DataExchange::*,
         LibraryLoader::*,
+        Memory::*,
         Ole::RevokeDragDrop,
         Registry::*,
         SystemServices::{MK_LBUTTON, SS_CENTERIMAGE, SS_NOTIFY},
@@ -105,6 +112,25 @@ const RESULTS_PREVIOUS: usize = 1174;
 const RESULTS_CLEAR: usize = 1175;
 const RESULTS_CLOSE: usize = 1176;
 const RESULTS_CANCEL: usize = 1177;
+const FIND_FILES: usize = 1180;
+const FIND_FILES_RUN: usize = 1181;
+const FIND_FILES_BROWSE: usize = 1182;
+const TAB_PIN: usize = 1500;
+const TAB_LEFT: usize = 1501;
+const TAB_RIGHT: usize = 1502;
+const MONITOR_FILES: usize = 1503;
+const TAB_SPLIT: usize = 1504;
+const TAB_COMPARE: usize = 1505;
+const COMPARE_SELECTION: usize = 1510;
+const COMPARE_CLIPBOARD: usize = 1511;
+const COMPARE_SAVED: usize = 1512;
+const COMPARE_IGNORE_SPACE: usize = 1520;
+const COMPARE_IGNORE_CASE: usize = 1521;
+const COMPARE_IGNORE_EMPTY: usize = 1522;
+const COMPARE_MOVES: usize = 1523;
+const COMPARE_ALIGN: usize = 1524;
+const COMPARE_REGEX: usize = 1525;
+const COMPARE_REGEX_CLEAR: usize = 1526;
 const SYMBOL_SPACE: usize = 1300;
 const SYMBOL_EOL: usize = 1301;
 const SYMBOL_NONPRINTING: usize = 1302;
@@ -187,6 +213,15 @@ const TOOLBAR: [toolbar::Button; 8] = [
     },
 ];
 
+#[derive(Clone, Copy)]
+struct TabDrag {
+    id: u64,
+    x: i32,
+    y: i32,
+    target: usize,
+    dragging: bool,
+}
+
 thread_local! {
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
     static COLORS: Cell<Palette> = Cell::new(Palette::new(false));
@@ -198,6 +233,7 @@ thread_local! {
     static TREE_UPDATING: Cell<bool> = const {Cell::new(false)};
     static HOT_BUTTON: Cell<HWND> = const {Cell::new(null_mut())};
     static ICON_ERROR_REPORTED: Cell<bool> = const {Cell::new(false)};
+    static TAB_DRAG: Cell<Option<TabDrag>> = const {Cell::new(None)};
 }
 
 enum Event {
@@ -221,6 +257,10 @@ enum Event {
     SplitDrag(i32),
     ResultActivate,
     ResultsResize(i32),
+    MoveTab(u64, usize),
+    PinTab(u64),
+    SplitTab(u64),
+    CompareTabs(u64, u64),
 }
 fn queue(event: Event) {
     EVENTS.with(|q| q.borrow_mut().push_back(event));
@@ -997,6 +1037,148 @@ unsafe extern "system" fn tab_proc(
 ) -> LRESULT {
     unsafe {
         match message {
+            WM_NCHITTEST => {
+                let mut point = POINT {
+                    x: l as i16 as i32,
+                    y: (l >> 16) as i16 as i32,
+                };
+                if ScreenToClient(hwnd, &mut point) != 0 && empty_tab_space(hwnd, point.x, point.y)
+                {
+                    // Native tabs otherwise let real mouse input pass through the empty strip.
+                    return HTCLIENT as isize;
+                }
+            }
+            WM_LBUTTONDBLCLK if empty_tab_space(hwnd, l as i16 as i32, (l >> 16) as i16 as i32) => {
+                TAB_DRAG.with(|drag| drag.set(None));
+                queue(Event::Command(NEW));
+                return 0;
+            }
+            WM_RBUTTONDOWN => {
+                return 0;
+            }
+            WM_RBUTTONUP => {
+                let mut hit = TCHITTESTINFO {
+                    pt: POINT {
+                        x: l as i16 as i32,
+                        y: (l >> 16) as i16 as i32,
+                    },
+                    flags: 0,
+                };
+                let index = SendMessageW(
+                    hwnd,
+                    TCM_HITTEST,
+                    0,
+                    (&mut hit as *mut TCHITTESTINFO) as isize,
+                );
+                if index >= 0 {
+                    let id = tab_document_id(hwnd, index as usize);
+                    let menu = CreatePopupMenu();
+                    AppendMenuW(menu, MF_STRING, TAB_PIN, wide("Pin / unpin tab").as_ptr());
+                    AppendMenuW(menu, MF_STRING, TAB_LEFT, wide("Move tab left").as_ptr());
+                    AppendMenuW(menu, MF_STRING, TAB_RIGHT, wide("Move tab right").as_ptr());
+                    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+                    AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        TAB_SPLIT,
+                        wide("Open in split view").as_ptr(),
+                    );
+                    let current =
+                        tab_document_id(hwnd, SendMessageW(hwnd, TCM_GETCURSEL, 0, 0) as usize);
+                    AppendMenuW(
+                        menu,
+                        MF_STRING | if current == id { MF_GRAYED } else { 0 },
+                        TAB_COMPARE,
+                        wide("Compare with current view").as_ptr(),
+                    );
+                    ClientToScreen(hwnd, &mut hit.pt);
+                    let action = TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        hit.pt.x,
+                        hit.pt.y,
+                        0,
+                        GetParent(hwnd),
+                        null(),
+                    );
+                    DestroyMenu(menu);
+                    if action as usize == TAB_PIN {
+                        queue(Event::PinTab(id));
+                    } else if action as usize == TAB_LEFT {
+                        queue(Event::MoveTab(id, (index as usize).saturating_sub(1)));
+                    } else if action as usize == TAB_RIGHT {
+                        queue(Event::MoveTab(
+                            id,
+                            (index as usize + 1)
+                                .min(SendMessageW(hwnd, TCM_GETITEMCOUNT, 0, 0) as usize - 1),
+                        ));
+                    } else if action as usize == TAB_SPLIT {
+                        queue(Event::SplitTab(id));
+                    } else if action as usize == TAB_COMPARE {
+                        queue(Event::CompareTabs(current, id));
+                    }
+                    return 0;
+                }
+            }
+            WM_MOUSEMOVE if GetCapture() == hwnd => {
+                if let Some(TabDrag {
+                    id,
+                    x,
+                    y,
+                    target,
+                    dragging,
+                }) = TAB_DRAG.with(Cell::get)
+                {
+                    let point = POINT {
+                        x: l as i16 as i32,
+                        y: (l >> 16) as i16 as i32,
+                    };
+                    let dragging = dragging || (point.x - x).abs() > 4 || (point.y - y).abs() > 4;
+                    let mut hit = TCHITTESTINFO {
+                        pt: point,
+                        flags: 0,
+                    };
+                    let index = SendMessageW(
+                        hwnd,
+                        TCM_HITTEST,
+                        0,
+                        (&mut hit as *mut TCHITTESTINFO) as isize,
+                    );
+                    let target = if index >= 0 { index as usize } else { target };
+                    TAB_DRAG.with(|drag| {
+                        drag.set(Some(TabDrag {
+                            id,
+                            x,
+                            y,
+                            target,
+                            dragging,
+                        }))
+                    });
+                    if dragging {
+                        SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                        return 0;
+                    }
+                }
+            }
+            WM_LBUTTONUP => {
+                if let Some(TabDrag {
+                    id,
+                    target,
+                    dragging: true,
+                    ..
+                }) = TAB_DRAG.with(|drag| drag.replace(None))
+                {
+                    ReleaseCapture();
+                    queue(Event::MoveTab(id, target));
+                    return 0;
+                }
+                if GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE => {
+                TAB_DRAG.with(|drag| drag.set(None));
+            }
             WM_ERASEBKGND => return 1,
             WM_PAINT => {
                 let mut paint: PAINTSTRUCT = zeroed();
@@ -1094,6 +1276,18 @@ unsafe extern "system" fn tab_proc(
                         queue(Event::CloseTab(index as usize));
                         return 0;
                     }
+                    if message == WM_LBUTTONDOWN {
+                        TAB_DRAG.with(|drag| {
+                            drag.set(Some(TabDrag {
+                                id: tab_document_id(hwnd, index as usize),
+                                x,
+                                y: hit.pt.y,
+                                target: index as usize,
+                                dragging: false,
+                            }))
+                        });
+                        SetCapture(hwnd);
+                    }
                 }
             }
             _ => {}
@@ -1101,6 +1295,46 @@ unsafe extern "system" fn tab_proc(
         DefSubclassProc(hwnd, message, w, l)
     }
 }
+unsafe fn empty_tab_space(hwnd: HWND, x: i32, y: i32) -> bool {
+    unsafe {
+        let mut client: RECT = zeroed();
+        if GetClientRect(hwnd, &mut client) == 0
+            || x < 0
+            || x >= client.right
+            || y < 0
+            || y >= client.bottom
+        {
+            return false;
+        }
+        let count = SendMessageW(hwnd, TCM_GETITEMCOUNT, 0, 0);
+        let mut last: RECT = zeroed();
+        if count > 0
+            && SendMessageW(
+                hwnd,
+                TCM_GETITEMRECT,
+                (count - 1) as usize,
+                (&mut last as *mut RECT) as isize,
+            ) == 0
+        {
+            return false;
+        }
+        x >= last.right
+    }
+}
+unsafe fn tab_document_id(hwnd: HWND, index: usize) -> u64 {
+    unsafe {
+        let mut item: TCITEMW = zeroed();
+        item.mask = TCIF_PARAM;
+        SendMessageW(
+            hwnd,
+            TCM_GETITEMW,
+            index,
+            (&mut item as *mut TCITEMW) as isize,
+        );
+        item.lParam as u64
+    }
+}
+
 fn system_dark() -> bool {
     let mut value: u32 = 1;
     let mut size = 4u32;
@@ -1137,6 +1371,36 @@ fn canonical_target(path: &Path) -> PathBuf {
     }
 }
 
+fn clipboard_text(owner: HWND) -> Result<String> {
+    unsafe {
+        if OpenClipboard(owner) == 0 {
+            return Err("Could not open the clipboard.".into());
+        }
+        let result = (|| {
+            let handle = GetClipboardData(13);
+            if handle.is_null() {
+                return Err("The clipboard does not contain Unicode text.".into());
+            }
+            let bytes = GlobalSize(handle);
+            if !(2..=core::MAX_TOOL_BYTES * 2 + 2).contains(&bytes) {
+                return Err("Clipboard text exceeds the comparison limit or is invalid.".into());
+            }
+            let pointer = GlobalLock(handle).cast::<u16>();
+            if pointer.is_null() {
+                return Err("Could not read clipboard text.".into());
+            }
+            let data = std::slice::from_raw_parts(pointer, bytes / 2);
+            let text = match data.iter().position(|&ch| ch == 0) {
+                Some(length) => String::from_utf16(&data[..length]).map_err(|e| e.to_string()),
+                None => Err("Clipboard text is not terminated.".into()),
+            };
+            GlobalUnlock(handle);
+            text
+        })();
+        CloseClipboard();
+        result
+    }
+}
 struct Document {
     handle: DocumentHandle,
     snapshot: DocumentSnapshot,
@@ -1157,6 +1421,13 @@ struct SearchBar {
     word: HWND,
     buttons: Vec<HWND>,
     visible: bool,
+    directory: HWND,
+    filters: HWND,
+    recursive: HWND,
+    hidden: HWND,
+    folder_labels: [HWND; 2],
+    folder_buttons: Vec<HWND>,
+    folder_visible: bool,
 }
 
 struct SearchTask {
@@ -1203,7 +1474,8 @@ struct CompareResult {
     right: u64,
     left_rev: u64,
     right_rev: u64,
-    result: Result<Vec<Difference>>,
+    generation: u64,
+    result: Result<Comparison>,
 }
 struct JsonResult {
     document: u64,
@@ -1241,6 +1513,15 @@ struct App {
     theme: String,
     editor_font: EditorFont,
     show_symbols: ShowSymbols,
+    monitor_files: bool,
+    monitor: Monitor,
+    monitor_busy: bool,
+    monitor_last: Instant,
+    compare_options: CompareOptions,
+    compare_generation: u64,
+    compare_ranges: Option<[(std::ops::Range<usize>, usize); 2]>,
+    compare_leading: [usize; 2],
+    compare_top: [usize; 2],
     font: HFONT,
     dpi: u32,
     map_visible: bool,
@@ -1430,10 +1711,39 @@ impl App {
             ("Close", SEARCH_CLOSE),
             ("Find all: current document", FIND_ALL_CURRENT),
             ("Find all: all open documents", FIND_ALL_OPEN),
+            ("Find in files...", FIND_FILES),
         ]
         .into_iter()
         .map(|(label, id)| self.button(label, id))
         .collect::<Result<_>>()?;
+        self.search.directory = self.search_field(410)?;
+        self.search.filters = self.search_field(411)?;
+        set_text(self.search.filters, "*");
+        self.search.recursive = self.control(
+            "BUTTON",
+            "Subfolders",
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            412,
+        )?;
+        self.search.hidden = self.control(
+            "BUTTON",
+            "Hidden files",
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            413,
+        )?;
+        unsafe {
+            SendMessageW(self.search.recursive, BM_SETCHECK, BST_CHECKED as usize, 0);
+            SendMessageW(self.search.directory, EM_SETLIMITTEXT, 32768, 0);
+            SendMessageW(self.search.filters, EM_SETLIMITTEXT, 8192, 0);
+        }
+        self.search.folder_labels = [
+            self.control("STATIC", "Folder:", SS_CENTERIMAGE, 414)?,
+            self.control("STATIC", "Filters:", SS_CENTERIMAGE, 415)?,
+        ];
+        self.search.folder_buttons = vec![
+            self.button("Browse...", FIND_FILES_BROWSE)?,
+            self.button("Search folder", FIND_FILES_RUN)?,
+        ];
         self.results.title =
             self.control("STATIC", "Search results", WS_VISIBLE | SS_CENTERIMAGE, 305)?;
         self.results.divider =
@@ -1482,6 +1792,9 @@ impl App {
                         (SAVE, "&Save\tCtrl+S"),
                         (SAVE_AS, "Save &as...\tCtrl+Shift+S"),
                         (CLOSE, "&Close tab\tCtrl+W"),
+                        (TAB_PIN, "Pin / unpin current tab"),
+                        (TAB_LEFT, "Move tab left"),
+                        (TAB_RIGHT, "Move tab right"),
                         (0, ""),
                         (EXIT, "E&xit (keep session)"),
                     ],
@@ -1517,6 +1830,7 @@ impl App {
                             FIND_ALL_OPEN,
                             "Find all in all open documents\tCtrl+Shift+Enter",
                         ),
+                        (FIND_FILES, "Find in files...\tCtrl+Shift+F"),
                         (0, ""),
                         (RESULTS_TOGGLE, "Search results panel\tCtrl+Alt+R"),
                         (RESULTS_NEXT, "Next search result\tF4"),
@@ -1530,6 +1844,7 @@ impl App {
                         (MAP, "Document map"),
                         (WRAP, "Word wrap"),
                         (EDITOR_FONT, "Editor &font..."),
+                        (MONITOR_FILES, "Automatically reload external changes"),
                         (ZOOM_RESET, "Reset zoom"),
                         (0, ""),
                         (THEME_SYSTEM, "Theme: Windows default"),
@@ -1541,6 +1856,9 @@ impl App {
                     "&Tools",
                     &[
                         (COMPARE, "Compare active tab with next tab"),
+                        (COMPARE_SELECTION, "Compare selected lines in both panes"),
+                        (COMPARE_CLIPBOARD, "Compare with clipboard"),
+                        (COMPARE_SAVED, "Compare with last saved file"),
                         (DIFF_NEXT, "Next difference\tF7"),
                         (DIFF_PREVIOUS, "Previous difference\tShift+F7"),
                         (COMPARE_CLEAR, "Clear compare"),
@@ -1560,6 +1878,25 @@ impl App {
                 menu_item(bar, menu as usize, label, true, true);
             }
             let view = GetSubMenu(bar, 3);
+            let compare_menu = new_menu(true);
+            for (id, label) in [
+                (COMPARE_IGNORE_SPACE, "Ignore whitespace"),
+                (COMPARE_IGNORE_CASE, "Ignore case"),
+                (COMPARE_IGNORE_EMPTY, "Ignore empty lines"),
+                (COMPARE_MOVES, "Detect moved lines"),
+                (COMPARE_ALIGN, "Align panes"),
+                (COMPARE_REGEX, "Use current Find expression as ignore regex"),
+                (COMPARE_REGEX_CLEAR, "Clear ignore regex"),
+            ] {
+                menu_item(compare_menu, id, label, false, false);
+            }
+            menu_item(
+                GetSubMenu(bar, 4),
+                compare_menu as usize,
+                "Comparison options",
+                true,
+                false,
+            );
             let symbols = new_menu(true);
             for (id, label) in [
                 (SYMBOL_SPACE, "Show space and tab"),
@@ -1739,6 +2076,15 @@ impl App {
                 (SYMBOL_ALL, self.show_symbols.all_characters()),
                 (SYMBOL_INDENT, self.show_symbols.indent_guides),
                 (SYMBOL_WRAP, self.show_symbols.wrap_markers),
+                (MONITOR_FILES, self.monitor_files),
+                (COMPARE_IGNORE_SPACE, self.compare_options.ignore_whitespace),
+                (COMPARE_IGNORE_CASE, self.compare_options.ignore_case),
+                (
+                    COMPARE_IGNORE_EMPTY,
+                    self.compare_options.ignore_empty_lines,
+                ),
+                (COMPARE_MOVES, self.compare_options.detect_moves),
+                (COMPARE_ALIGN, self.compare_options.align),
             ] {
                 CheckMenuItem(
                     menu,
@@ -1913,6 +2259,14 @@ impl App {
             ];
             controls.extend(&self.tools);
             controls.extend(self.search.labels);
+            controls.extend([
+                self.search.directory,
+                self.search.filters,
+                self.search.recursive,
+                self.search.hidden,
+            ]);
+            controls.extend(self.search.folder_labels);
+            controls.extend(&self.search.folder_buttons);
             if let Some(tooltips) = &self.tooltips {
                 controls.push(tooltips.hwnd);
             }
@@ -1954,6 +2308,12 @@ impl App {
             let search_layout = SearchLayout::new(width, self.dpi);
             let search_h = if self.search.visible {
                 search_layout.height
+                    + self.scale(40)
+                    + if self.search.folder_visible {
+                        self.scale(80)
+                    } else {
+                        0
+                    }
             } else {
                 0
             };
@@ -2004,7 +2364,18 @@ impl App {
             );
             MoveWindow(self.tree, 0, top, tree_w, body_h, 1);
             ShowWindow(self.tree, if self.tree_visible { SW_SHOW } else { SW_HIDE });
-            MoveWindow(self.editors[0].hwnd, tree_w, top, left_w, body_h, 1);
+            let left_top = (self.compare_top[0] as i32
+                * self.editors[0].send(SCI_TEXTHEIGHT, 0, 0).max(1) as i32)
+                .min(body_h - 1)
+                .max(0);
+            MoveWindow(
+                self.editors[0].hwnd,
+                tree_w,
+                top + left_top,
+                left_w,
+                body_h - left_top,
+                1,
+            );
             ShowWindow(
                 self.editors[1].hwnd,
                 if self.secondary.is_some() {
@@ -2014,12 +2385,16 @@ impl App {
                 },
             );
             if self.secondary.is_some() {
+                let right_top = (self.compare_top[1] as i32
+                    * self.editors[1].send(SCI_TEXTHEIGHT, 0, 0).max(1) as i32)
+                    .min(body_h - 1)
+                    .max(0);
                 MoveWindow(
                     self.editors[1].hwnd,
                     tree_w + left_w + gap,
-                    top,
+                    top + right_top,
                     (content_w - left_w - gap).max(1),
-                    body_h,
+                    body_h - right_top,
                     1,
                 );
             }
@@ -2102,6 +2477,87 @@ impl App {
             for (hwnd, bounds) in self.search.buttons.iter().zip(search_layout.buttons) {
                 place(*hwnd, bounds);
             }
+            MoveWindow(
+                self.search.buttons[7],
+                self.scale(76),
+                y + search_layout.height,
+                self.scale(180),
+                self.scale(32),
+                1,
+            );
+            let folder_y = y + search_layout.height + self.scale(40);
+            for (row, field) in [self.search.directory, self.search.filters]
+                .into_iter()
+                .enumerate()
+            {
+                MoveWindow(
+                    self.search.folder_labels[row],
+                    self.scale(12),
+                    folder_y + self.scale(row as i32 * 40),
+                    self.scale(56),
+                    self.scale(32),
+                    1,
+                );
+                MoveWindow(
+                    field,
+                    self.scale(76),
+                    folder_y + self.scale(row as i32 * 40),
+                    (width - self.scale(420)).max(1),
+                    self.scale(32),
+                    1,
+                );
+            }
+            MoveWindow(
+                self.search.folder_buttons[0],
+                width - self.scale(330),
+                folder_y,
+                self.scale(110),
+                self.scale(32),
+                1,
+            );
+            MoveWindow(
+                self.search.folder_buttons[1],
+                width - self.scale(210),
+                folder_y,
+                self.scale(192),
+                self.scale(32),
+                1,
+            );
+            MoveWindow(
+                self.search.recursive,
+                width - self.scale(330),
+                folder_y + self.scale(40),
+                self.scale(125),
+                self.scale(32),
+                1,
+            );
+            MoveWindow(
+                self.search.hidden,
+                width - self.scale(195),
+                folder_y + self.scale(40),
+                self.scale(175),
+                self.scale(32),
+                1,
+            );
+            for control in [
+                self.search.directory,
+                self.search.filters,
+                self.search.recursive,
+                self.search.hidden,
+            ]
+            .into_iter()
+            .chain(self.search.folder_labels)
+            .chain(self.search.folder_buttons.iter().copied())
+            {
+                ShowWindow(
+                    control,
+                    if self.search.visible && self.search.folder_visible {
+                        SW_SHOW
+                    } else {
+                        SW_HIDE
+                    },
+                );
+            }
             for control in [
                 self.search.query,
                 self.search.replace,
@@ -2162,6 +2618,9 @@ impl App {
         Ok(())
     }
     fn new_document(&mut self) -> Result<()> {
+        if self.comparing {
+            self.clear_compare();
+        }
         let title = format!("Untitled {}", self.next_id);
         self.add_document(DocumentSnapshot {
             id: 0,
@@ -2174,6 +2633,7 @@ impl App {
             dirty: false,
             disk_hash: None,
             caret: 0,
+            pinned: false,
         })
     }
     fn switch(&mut self, index: usize) -> Result<()> {
@@ -2209,13 +2669,51 @@ impl App {
                     &self.editor_font,
                 )?;
                 self.editors[pane].send(SCI_SETEOLMODE, doc.snapshot.eol.scintilla(), 0);
-                self.editors[pane].send(SCI_SETWRAPMODE, self.wrap as usize, 0);
+                self.editors[pane].send(
+                    SCI_SETWRAPMODE,
+                    (self.wrap && !(self.comparing && self.compare_options.align)) as usize,
+                    0,
+                );
             }
         }
         self.apply_symbols();
         self.configure_map();
         self.layout();
         Ok(())
+    }
+    fn split_tab(&mut self, id: u64) -> Result<()> {
+        let index = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == id)
+            .ok_or("This tab is no longer open.")?;
+        self.clear_compare();
+        let other = 1 - self.focused;
+        if other == 1 {
+            self.secondary = Some(index);
+        } else {
+            self.primary = index;
+        }
+        self.refresh_views()?;
+        self.editors[other].send(SCI_GOTOPOS, self.documents[index].snapshot.caret, 0);
+        self.update_tabs();
+        self.update_status();
+        self.editor().focus();
+        self.touch();
+        Ok(())
+    }
+    fn compare_tabs(&mut self, current: u64, target: u64) -> Result<()> {
+        let left = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == current)
+            .ok_or("The current document is no longer open.")?;
+        let right = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == target)
+            .ok_or("This tab is no longer open.")?;
+        self.begin_compare(left, right)
     }
     fn configure_map(&self) {
         if self.documents.is_empty() {
@@ -2272,7 +2770,8 @@ impl App {
             SendMessageW(self.tabs, TCM_DELETEALLITEMS, 0, 0);
             for (i, doc) in self.documents.iter().enumerate() {
                 let mut label = wide(&format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
+                    if doc.snapshot.pinned { "[P] " } else { "" },
                     if self.secondary == Some(i) {
                         "[R] "
                     } else {
@@ -2282,8 +2781,9 @@ impl App {
                     if doc.snapshot.dirty { " *" } else { "" }
                 ));
                 let mut item: TCITEMW = zeroed();
-                item.mask = TCIF_TEXT;
+                item.mask = TCIF_TEXT | TCIF_PARAM;
                 item.pszText = label.as_mut_ptr();
+                item.lParam = doc.snapshot.id as isize;
                 SendMessageW(
                     self.tabs,
                     TCM_INSERTITEMW,
@@ -2304,6 +2804,165 @@ impl App {
                 if doc.snapshot.dirty { " *" } else { "" }
             ),
         );
+    }
+    fn reorder_tabs(&mut self, id: u64, requested: Option<usize>) -> Result<()> {
+        let from = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == id)
+            .ok_or("This tab is no longer open.")?;
+        let primary = self.documents[self.primary].snapshot.id;
+        let secondary = self
+            .secondary
+            .map(|index| self.documents[index].snapshot.id);
+        if let Some(requested) = requested {
+            let pins: Vec<_> = self
+                .documents
+                .iter()
+                .map(|doc| doc.snapshot.pinned)
+                .collect();
+            let target = tabs::move_target(&pins, from, requested)?;
+            let document = self.documents.remove(from);
+            self.documents.insert(target, document);
+        } else {
+            self.documents[from].snapshot.pinned = !self.documents[from].snapshot.pinned;
+            self.documents.sort_by_key(|doc| !doc.snapshot.pinned);
+        }
+        self.primary = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == primary)
+            .expect("existing primary");
+        self.secondary =
+            secondary.and_then(|id| self.documents.iter().position(|doc| doc.snapshot.id == id));
+        self.update_tabs();
+        self.touch();
+        Ok(())
+    }
+    fn poll_monitor(&mut self) -> Result<()> {
+        match self.monitor.rx.try_recv() {
+            Ok(changes) => {
+                self.monitor_busy = false;
+                if self.monitor_files {
+                    for change in changes {
+                        self.apply_external_change(change)?;
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.monitor_files = false;
+                self.monitor_busy = false;
+                self.update_symbol_checks();
+                return Err(
+                    "File monitoring worker stopped. Automatic reload has been disabled.".into(),
+                );
+            }
+        }
+        if self.monitor_files
+            && !self.monitor_busy
+            && self.monitor_last.elapsed() >= Duration::from_secs(1)
+        {
+            let requests = self
+                .documents
+                .iter()
+                .filter_map(|doc| {
+                    doc.snapshot.path.clone().map(|path| monitor::Request {
+                        id: doc.snapshot.id,
+                        path,
+                        known_hash: doc.snapshot.disk_hash,
+                        encoding: doc.snapshot.encoding.clone(),
+                    })
+                })
+                .collect();
+            self.monitor.submit(requests)?;
+            self.monitor_busy = true;
+            self.monitor_last = Instant::now();
+        }
+        Ok(())
+    }
+    fn apply_external_change(&mut self, change: monitor::Change) -> Result<()> {
+        let Some(index) = self.documents.iter().position(|doc| {
+            doc.snapshot.id == change.id
+                && doc.snapshot.path.as_ref() == Some(&change.path)
+                && doc.snapshot.disk_hash == change.baseline_hash
+        }) else {
+            return Ok(());
+        };
+        let snapshot = match change.result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.note(format!("External file monitoring: {error}"));
+                return Ok(());
+            }
+        };
+        self.scratch.attach(&self.documents[index].handle);
+        let dirty = self.documents[index].base_dirty
+            || self.documents[index].metadata_dirty
+            || self.scratch.send(SCI_GETMODIFY, 0, 0) != 0;
+        if dirty
+            && ask(
+                self.hwnd,
+                &format!(
+                    "{} was changed by another program.\n\nReload from disk and discard this tab's unsaved edits?\nChoose No to keep your edits; saving will still check for a disk conflict.",
+                    change.path.display()
+                ),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) != IDYES
+        {
+            self.note("External change not reloaded: your unsaved edits were kept.");
+            return Ok(());
+        }
+        let views: Vec<_> = [(0, self.primary), (1, self.secondary.unwrap_or(usize::MAX))]
+            .into_iter()
+            .filter(|(_, doc)| *doc == index)
+            .map(|(pane, _)| {
+                let editor = self.editors[pane];
+                (
+                    editor,
+                    editor.send(SCI_GETANCHOR, 0, 0),
+                    editor.position(),
+                    editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0),
+                    editor.send(SCI_GETXOFFSET, 0, 0),
+                )
+            })
+            .collect();
+        self.scratch.set_text(&snapshot.text)?;
+        self.scratch
+            .send(SCI_SETEOLMODE, snapshot.eol.scintilla(), 0);
+        for (editor, anchor, caret, scroll, x) in views {
+            editor.send(
+                SCI_SETSEL,
+                (anchor.max(0) as usize).min(editor.length()),
+                caret.min(editor.length()) as isize,
+            );
+            editor.send(SCI_SETFIRSTVISIBLELINE, scroll.max(0) as usize, 0);
+            editor.send(SCI_SETXOFFSET, x.max(0) as usize, 0);
+        }
+        let doc = &mut self.documents[index];
+        doc.snapshot.encoding = snapshot.encoding;
+        doc.snapshot.eol = snapshot.eol;
+        doc.snapshot.disk_hash = Some(snapshot.hash);
+        doc.snapshot.dirty = false;
+        doc.snapshot.caret = doc.snapshot.caret.min(snapshot.text.len());
+        doc.base_dirty = false;
+        doc.metadata_dirty = false;
+        doc.revision += 1;
+        doc.styled_revision = None;
+        doc.last_edit = Instant::now() - Duration::from_secs(1);
+        if self.comparing {
+            self.compare_due = Some(Instant::now());
+        }
+        if self.tree_visible && index == self.index() {
+            self.schedule_json();
+        }
+        self.update_tabs();
+        self.touch();
+        self.note(format!(
+            "Reloaded external changes: {}",
+            change.path.display()
+        ));
+        Ok(())
     }
     fn update_status(&self) {
         if self.documents.is_empty() {
@@ -2388,6 +3047,7 @@ impl App {
             dirty: false,
             disk_hash: Some(session::fingerprint(&bytes)),
             caret: 0,
+            pinned: false,
         })?;
         if fallback {
             self.note("No Unicode BOM / valid UTF-8: opened as Windows-1252; Encoding > Reopen can change this.");
@@ -2596,6 +3256,8 @@ impl App {
             theme: self.theme.clone(),
             editor_font: self.editor_font.clone(),
             show_symbols: self.show_symbols,
+            monitor_files: self.monitor_files,
+            compare_options: self.compare_options.clone(),
             custom_languages: self
                 .languages
                 .iter()
@@ -2638,10 +3300,96 @@ impl App {
         }
         Ok(())
     }
+    fn show_folder_search(&mut self) -> Result<()> {
+        self.search.folder_visible = true;
+        if window_text(self.search.directory).is_empty() {
+            let directory = self.documents[self.index()]
+                .snapshot
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .map(Ok)
+                .unwrap_or_else(std::env::current_dir)
+                .map_err(|e| e.to_string())?;
+            set_text(self.search.directory, &directory.display().to_string());
+        }
+        self.show_search()
+    }
+    fn browse_folder(&self) -> Result<()> {
+        unsafe {
+            let title = wide("Choose the folder to search");
+            let mut info: BROWSEINFOW = zeroed();
+            info.hwndOwner = self.hwnd;
+            info.lpszTitle = title.as_ptr();
+            info.ulFlags = BIF_RETURNONLYFSDIRS;
+            let item = SHBrowseForFolderW(&info);
+            if item.is_null() {
+                return Ok(());
+            }
+            let mut path = vec![0u16; 32768];
+            let valid = SHGetPathFromIDListW(item, path.as_mut_ptr());
+            CoTaskMemFree(item.cast());
+            if valid == 0 {
+                return Err("The chosen folder cannot be represented as a filesystem path.".into());
+            }
+            let length = path.iter().position(|&ch| ch == 0).unwrap_or(path.len());
+            set_text(
+                self.search.directory,
+                &String::from_utf16(&path[..length]).map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(())
+    }
+    fn start_find_files(&mut self) -> Result<()> {
+        if self.results.job.is_some() {
+            return Err(
+                "A search is already running. Cancel it before searching another folder.".into(),
+            );
+        }
+        let query = window_text(self.search.query);
+        let search = self.search_settings()?;
+        let options = FolderOptions {
+            directory: PathBuf::from(window_text(self.search.directory)),
+            filters: window_text(self.search.filters),
+            recursive: unsafe { SendMessageW(self.search.recursive, BM_GETCHECK, 0, 0) }
+                == BST_CHECKED as isize,
+            hidden: unsafe { SendMessageW(self.search.hidden, BM_GETCHECK, 0, 0) }
+                == BST_CHECKED as isize,
+        };
+        options.validate()?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = cancelled.clone();
+        let (tx, rx) = mpsc::channel();
+        self.results
+            .editor
+            .set_read_only_text("Searching files on disk...\n")?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        self.results.data = None;
+        self.results.links.clear();
+        self.results.current = None;
+        self.results.visible = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(folder_search::find_in_files(
+                &search, query, options, &token,
+            ));
+        });
+        self.results.job = Some(SearchTask {
+            rx,
+            cancelled,
+            discard: false,
+        });
+        self.result_message("Searching files on disk (unsaved tab edits are not searched)...");
+        self.update_result_buttons();
+        self.layout();
+        Ok(())
+    }
     fn find(&mut self, previous: bool) -> Result<()> {
         let search = self.search_settings()?;
         let editor = self.editor();
-        let text = self.tool_text(editor)?;
+        let text = self.search_text(editor)?;
         let selection = editor.selection();
         let search_key = format!(
             "{}:{}:{}:{}",
@@ -2690,10 +3438,14 @@ impl App {
         }
         editor.text()
     }
+    fn search_text(&self, editor: Editor) -> Result<String> {
+        Search::validate_size(editor.length())?;
+        editor.text()
+    }
     fn replace(&mut self, all: bool) -> Result<()> {
         let search = self.search_settings()?;
         let editor = self.editor();
-        let text = self.tool_text(editor)?;
+        let text = self.search_text(editor)?;
         let replacement = window_text(self.search.replace);
         if all {
             let (out, count) = search.replace_all(&text, &replacement)?;
@@ -2756,6 +3508,10 @@ impl App {
             for button in self.search.buttons.iter().skip(5) {
                 EnableWindow(*button, self.results.job.is_none() as i32);
             }
+            EnableWindow(
+                self.search.folder_buttons[1],
+                self.results.job.is_none() as i32,
+            );
         }
     }
     fn start_find_all(&mut self, all_open: bool) -> Result<()> {
@@ -2782,15 +3538,15 @@ impl App {
             }
             self.scratch.attach(&doc.handle);
             let length = self.scratch.length();
-            if length > core::MAX_TOOL_BYTES {
-                return Err(format!(
-                    "{} exceeds the 16 MiB search limit. No documents were skipped or searched.",
+            Search::validate_size(length).map_err(|error| {
+                format!(
+                    "{}: {error} No documents were searched.",
                     doc.snapshot.title
-                ));
-            }
+                )
+            })?;
             bytes += length;
             if bytes > search_results::MAX_BATCH_BYTES {
-                return Err("Find All is limited to 64 MiB across open documents. Close some tabs or search the current document.".into());
+                return Err("Find All is limited to 256 MiB across open documents. Close some tabs or search the current document.".into());
             }
             let title = doc
                 .snapshot
@@ -2853,10 +3609,11 @@ impl App {
         self.results.links = rendered.links;
         self.results.current = None;
         let stale = results.files.iter().any(|file| {
-            !self
-                .documents
-                .iter()
-                .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+            file.source.is_none()
+                && !self
+                    .documents
+                    .iter()
+                    .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
         });
         let summary = results.summary()
             + if stale {
@@ -2895,20 +3652,31 @@ impl App {
             return Ok(());
         };
         let file = &results.files[link.file];
-        let Some(document) = self
-            .documents
-            .iter()
-            .position(|doc| doc.snapshot.id == file.id)
-        else {
-            self.result_message("This result's document was closed. Run Find All again.");
-            return Ok(());
-        };
-        if self.documents[document].revision != file.revision {
-            self.result_message("This document changed since the search. Run Find All again before navigating its results.");
-            return Ok(());
-        }
         let range = file.hits[link.hit].range.clone();
         let row = link.row;
+        let source = file.source.clone();
+        let id = file.id;
+        let revision = file.revision;
+        let document = if let Some(source) = source {
+            folder_search::verify_source(&source)?;
+            self.open_path(&source.path, None)?;
+            let document = self.index();
+            self.scratch.attach(&self.documents[document].handle);
+            if session::fingerprint(self.scratch.text()?.as_bytes()) != source.text_hash {
+                return Err("The open tab differs from the searched file. Your edits were kept; save or reload and search again.".into());
+            }
+            document
+        } else {
+            let Some(document) = self.documents.iter().position(|doc| doc.snapshot.id == id) else {
+                self.result_message("This result's document was closed. Run Find All again.");
+                return Ok(());
+            };
+            if self.documents[document].revision != revision {
+                self.result_message("This document changed since the search. Run Find All again before navigating its results.");
+                return Ok(());
+            }
+            document
+        };
         // A compare binds two particular documents; do not silently change its pair.
         if self.comparing && document != self.index() {
             self.clear_compare();
@@ -2972,9 +3740,11 @@ impl App {
                     return false;
                 };
                 let file = &results.files[self.results.links[*candidate].file];
-                self.documents
-                    .iter()
-                    .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+                file.source.is_some()
+                    || self
+                        .documents
+                        .iter()
+                        .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
             });
         self.activate_result(valid.unwrap_or(index))
     }
@@ -3027,20 +3797,155 @@ impl App {
         self.compare_rx = None;
         self.compare_due = None;
         self.compare_jump = false;
+        self.compare_ranges = None;
+        self.compare_leading = [0; 2];
+        self.compare_top = [0; 2];
+        self.compare_generation = self.compare_generation.wrapping_add(1);
+        for editor in self.editors {
+            editor.send(SCI_SETWRAPMODE, self.wrap as usize, 0);
+        }
+        self.layout();
     }
     fn start_compare(&mut self) -> Result<()> {
         if self.documents.len() < 2 {
             return Err("Open two documents in separate tabs to compare.".into());
         }
+        let left = self.index();
+        self.begin_compare(left, (left + 1) % self.documents.len())
+    }
+    fn begin_compare(&mut self, left: usize, right: usize) -> Result<()> {
+        if left == right || left >= self.documents.len() || right >= self.documents.len() {
+            return Err("Choose two different documents to compare.".into());
+        }
+        self.compare_options.validate()?;
         self.clear_compare();
-        self.primary = self.index();
+        self.primary = left;
         self.focused = 0;
-        self.secondary = Some((self.primary + 1) % self.documents.len());
+        self.secondary = Some(right);
         self.refresh_views()?;
         self.update_tabs();
+        self.editor().focus();
         self.comparing = true;
         self.compare_jump = true;
         self.launch_compare()
+    }
+    fn compare_selection(&mut self) -> Result<()> {
+        if self.secondary.is_none() || self.secondary == Some(self.primary) {
+            return Err(
+                "Open two different documents in split view and select text in both panes.".into(),
+            );
+        }
+        let mut ranges = Vec::new();
+        for editor in self.editors {
+            if editor.send(SCI_GETSELECTIONS, 0, 0) != 1 {
+                return Err(
+                    "Selection comparison requires one contiguous selection in each pane.".into(),
+                );
+            }
+            let selected = editor.selection();
+            if selected.is_empty() {
+                return Err("Select text in both panes before comparing selected lines.".into());
+            }
+            let first = editor.send(SCI_LINEFROMPOSITION, selected.start, 0).max(0) as usize;
+            let last = editor
+                .send(SCI_LINEFROMPOSITION, selected.end.saturating_sub(1), 0)
+                .max(0) as usize;
+            let start = editor.send(SCI_POSITIONFROMLINE, first, 0).max(0) as usize;
+            let end = editor.send(SCI_POSITIONFROMLINE, last + 1, 0);
+            ranges.push((
+                start..if end < 0 {
+                    editor.length()
+                } else {
+                    end as usize
+                },
+                first,
+            ));
+        }
+        self.clear_compare();
+        self.compare_ranges = Some([ranges.remove(0), ranges.remove(0)]);
+        self.comparing = true;
+        self.compare_jump = true;
+        self.launch_compare()
+    }
+    fn compare_snapshot(&mut self, saved: bool) -> Result<()> {
+        let original = self.index();
+        let source = self.documents[original].snapshot.clone();
+        let text = if saved {
+            let path = source
+                .path
+                .as_ref()
+                .ok_or("Save this document before comparing with its on-disk version.")?;
+            let bytes = session::read_bounded(path, core::MAX_TOOL_BYTES)?;
+            core::decode(&bytes, Some(&source.encoding))?.0
+        } else {
+            clipboard_text(self.hwnd)?
+        };
+        self.clear_compare();
+        self.add_document(DocumentSnapshot {
+            id: 0,
+            title: if saved {
+                format!("Saved: {}", source.title)
+            } else {
+                "Clipboard comparison".into()
+            },
+            path: None,
+            eol: Eol::detect(&text),
+            text,
+            encoding: source.encoding,
+            language: source.language,
+            dirty: false,
+            disk_hash: None,
+            caret: 0,
+            pinned: false,
+        })?;
+        self.primary = original;
+        self.secondary = Some(self.documents.len() - 1);
+        self.focused = 0;
+        self.comparing = true;
+        self.compare_jump = true;
+        self.refresh_views()?;
+        self.update_tabs();
+        self.launch_compare()
+    }
+    fn change_compare_options(&mut self, command: usize) -> Result<()> {
+        let mut options = self.compare_options.clone();
+        match command {
+            COMPARE_IGNORE_SPACE => options.ignore_whitespace = !options.ignore_whitespace,
+            COMPARE_IGNORE_CASE => options.ignore_case = !options.ignore_case,
+            COMPARE_IGNORE_EMPTY => options.ignore_empty_lines = !options.ignore_empty_lines,
+            COMPARE_MOVES => options.detect_moves = !options.detect_moves,
+            COMPARE_ALIGN => options.align = !options.align,
+            COMPARE_REGEX => {
+                options.ignore_regex = window_text(self.search.query);
+                if options.ignore_regex.is_empty() {
+                    self.show_search()?;
+                    self.note("Enter an expression in Find, then choose Tools > Comparison options > Use current Find expression as ignore regex.");
+                    return Ok(());
+                }
+            }
+            COMPARE_REGEX_CLEAR => options.ignore_regex.clear(),
+            _ => unreachable!(),
+        }
+        options.validate()?;
+        self.compare_options = options;
+        self.compare_generation = self.compare_generation.wrapping_add(1);
+        if self.comparing {
+            for editor in self.editors {
+                editor.clear_diff();
+                editor.send(
+                    SCI_SETWRAPMODE,
+                    (self.wrap && !self.compare_options.align) as usize,
+                    0,
+                );
+            }
+            self.compare_leading = [0; 2];
+            self.compare_top = [0; 2];
+            self.compare_due = Some(Instant::now());
+            self.layout();
+        }
+        self.update_symbol_checks();
+        self.touch();
+        Ok(())
     }
     fn launch_compare(&mut self) -> Result<()> {
         if self.compare_rx.is_some() {
@@ -3055,16 +3960,40 @@ impl App {
         let right_id = right.snapshot.id;
         let left_rev = left.revision;
         let right_rev = right.revision;
-        let left_text = self.tool_text(self.editors[0])?;
-        let right_text = self.tool_text(self.editors[1])?;
+        let (left_text, right_text) = if let Some(ranges) = &self.compare_ranges {
+            (
+                self.editors[0].range(ranges[0].0.clone())?,
+                self.editors[1].range(ranges[1].0.clone())?,
+            )
+        } else {
+            (
+                self.tool_text(self.editors[0])?,
+                self.tool_text(self.editors[1])?,
+            )
+        };
+        let ranges = self.compare_ranges.clone();
+        let options = self.compare_options.clone();
+        let generation = self.compare_generation;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = core::compare(&left_text, &right_text);
+            let result =
+                comparison::compare(&left_text, &right_text, &options).map(|mut result| {
+                    if let Some(ranges) = ranges {
+                        result.offset(
+                            ranges[0].0.start,
+                            ranges[0].1,
+                            ranges[1].0.start,
+                            ranges[1].1,
+                        );
+                    }
+                    result
+                });
             let _ = tx.send(CompareResult {
                 left: left_id,
                 right: right_id,
                 left_rev,
                 right_rev,
+                generation,
                 result,
             });
         });
@@ -3082,17 +4011,50 @@ impl App {
             || self.documents[right].snapshot.id != result.right
             || self.documents[left].revision != result.left_rev
             || self.documents[right].revision != result.right_rev
+            || self.compare_generation != result.generation
         {
             if self.comparing {
                 self.compare_due = Some(Instant::now() + Duration::from_millis(300));
             }
             return Ok(());
         }
+        let comparison = result.result?;
+        let virtual_row = if self.compare_jump {
+            0
+        } else {
+            let pane = self.focused;
+            (self.editors[pane]
+                .send(SCI_GETFIRSTVISIBLELINE, 0, 0)
+                .max(0) as usize
+                + self.compare_leading[pane])
+                .saturating_sub(self.compare_top[pane])
+        };
         for editor in self.editors {
             editor.clear_diff();
         }
-        self.differences = result.result?;
+        self.differences = comparison.differences;
         self.comparing = true;
+        for (pane, padding) in [comparison.left_padding, comparison.right_padding]
+            .iter()
+            .enumerate()
+        {
+            self.editors[pane].send(
+                SCI_SETWRAPMODE,
+                (self.wrap && !self.compare_options.align) as usize,
+                0,
+            );
+            self.compare_leading[pane] = if self.compare_options.align {
+                self.editors[pane].apply_compare_padding(padding)?
+            } else {
+                0
+            };
+            self.compare_top[pane] = self.compare_leading[pane].saturating_sub(virtual_row);
+            self.editors[pane].send(
+                SCI_SETFIRSTVISIBLELINE,
+                virtual_row.saturating_sub(self.compare_leading[pane]),
+                0,
+            );
+        }
         for difference in &self.differences {
             for line in difference.left.clone() {
                 self.editors[0].send(SCI_MARKERADD, line, 20);
@@ -3107,9 +4069,14 @@ impl App {
                 self.editors[1].indicator(21, range.clone())?;
             }
         }
+        for moved in &comparison.moves {
+            self.editors[0].send(SCI_MARKERADD, moved.left, 22);
+            self.editors[1].send(SCI_MARKERADD, moved.right, 22);
+        }
+        self.layout();
         self.note(format!(
-            "{} difference groups. Red: left changes; green: right changes. F7 to navigate.",
-            self.differences.len()
+            "{} difference groups, {} moved lines. Red: left; green: right; blue: moved. F7 to navigate.",
+            self.differences.len(),comparison.moves.len()
         ));
         if self.compare_jump && !self.differences.is_empty() {
             self.difference = self.differences.len() - 1;
@@ -3478,6 +4445,24 @@ impl App {
                 self.save_document(true)?;
             }
             CLOSE => self.close_document()?,
+            TAB_PIN => self.reorder_tabs(self.documents[self.index()].snapshot.id, None)?,
+            TAB_LEFT | TAB_RIGHT => {
+                let index = self.index();
+                let target = if command == TAB_LEFT {
+                    index.saturating_sub(1)
+                } else {
+                    (index + 1).min(self.documents.len() - 1)
+                };
+                self.reorder_tabs(self.documents[index].snapshot.id, Some(target))?;
+            }
+            MONITOR_FILES => {
+                self.monitor_files = !self.monitor_files;
+                if self.monitor_files {
+                    self.monitor.reset();
+                }
+                self.update_symbol_checks();
+                self.touch();
+            }
             EXIT => self.close()?,
             UNDO | REDO | CUT | COPY | PASTE | SELECT_ALL | DUPLICATE | DELETE_LINE => {
                 let message = match command {
@@ -3540,7 +4525,13 @@ impl App {
             SELECT_MATCHES => {
                 editor.send(SCI_MULTIPLESELECTADDEACH, 0, 0);
             }
-            FIND => self.show_search()?,
+            FIND => {
+                self.search.folder_visible = false;
+                self.show_search()?;
+            }
+            FIND_FILES => self.show_folder_search()?,
+            FIND_FILES_BROWSE => self.browse_folder()?,
+            FIND_FILES_RUN => self.start_find_files()?,
             SEARCH_CLOSE => {
                 self.search.visible = false;
                 self.layout();
@@ -3599,7 +4590,11 @@ impl App {
             WRAP => {
                 self.wrap = !self.wrap;
                 for ed in self.editors {
-                    ed.send(SCI_SETWRAPMODE, self.wrap as usize, 0);
+                    ed.send(
+                        SCI_SETWRAPMODE,
+                        (self.wrap && !(self.comparing && self.compare_options.align)) as usize,
+                        0,
+                    );
                 }
             }
             SYMBOL_SPACE | SYMBOL_EOL | SYMBOL_NONPRINTING | SYMBOL_CONTROLS | SYMBOL_ALL
@@ -3641,6 +4636,13 @@ impl App {
                 self.touch();
             }
             COMPARE => self.start_compare()?,
+            COMPARE_SELECTION => self.compare_selection()?,
+            COMPARE_CLIPBOARD => self.compare_snapshot(false)?,
+            COMPARE_SAVED => self.compare_snapshot(true)?,
+            COMPARE_IGNORE_SPACE | COMPARE_IGNORE_CASE | COMPARE_IGNORE_EMPTY | COMPARE_MOVES
+            | COMPARE_ALIGN | COMPARE_REGEX | COMPARE_REGEX_CLEAR => {
+                self.change_compare_options(command)?
+            }
             COMPARE_CLEAR => {
                 self.clear_compare();
                 self.note("Compare cleared.");
@@ -3688,7 +4690,7 @@ impl App {
                     concat!(
                         "rstpd ",
                         env!("CARGO_PKG_VERSION"),
-                        "\nRust application with statically linked Scintilla + Lexilla.\nNo plugin loader, script execution, network service, or automatic updater.\n\nAlt+drag: rectangular selection\nCtrl+click: multiple carets\nCtrl+D / Ctrl+Shift+L: next / all occurrences\nF6: focus other pane; Ctrl+Tab: next tab\nCtrl+Space: contextual completion\nCtrl+Shift+Space: function parameter hint\nCtrl+mouse wheel: zoom\nCtrl+Alt+J: format JSON/JSON5; Ctrl+Alt+T: live JSON tree\nF7 / Shift+F7: next / previous difference\n\nCompare and JSON refresh automatically after edits.\nLanguage menu: import data-only language/API XML.\nUnsaved tabs recover when the app reopens. Close the app to keep them.\nRecovery is local plaintext; existing recovery folders are preserved.\nSee README for current and legacy recovery locations.\nRegex supports look-around/backreferences ($1 or ${name} replacements).\nFiles: 128 MiB; search, line and JSON tools: 16 MiB.\n\nIndependent application; not affiliated with Notepad++."
+                        "\nRust application with statically linked Scintilla + Lexilla.\nNo plugin loader, script execution, network service, or automatic updater.\n\nAlt+drag: rectangular selection\nCtrl+click: multiple carets\nCtrl+D / Ctrl+Shift+L: next / all occurrences\nF6: focus other pane; Ctrl+Tab: next tab\nCtrl+Space: contextual completion\nCtrl+Shift+Space: function parameter hint\nCtrl+mouse wheel: zoom\nCtrl+Alt+J: format JSON/JSON5; Ctrl+Alt+T: live JSON tree\nF7 / Shift+F7: next / previous difference\n\nCompare and JSON refresh automatically after edits.\nLanguage menu: import data-only language/API XML.\nUnsaved tabs recover when the app reopens. Close the app to keep them.\nRecovery is local plaintext; existing recovery folders are preserved.\nSee README for current and legacy recovery locations.\nRegex supports look-around/backreferences ($1 or ${name} replacements).\nFiles: 256 MiB; search/replace: 128 MiB; line and JSON tools: 16 MiB.\n\nIndependent application; not affiliated with Notepad++."
                     ),
                     MB_OK | MB_ICONINFORMATION,
                 );
@@ -3775,6 +4777,7 @@ impl App {
             (true, true, false, 0x53) => Some(SAVE_AS),
             (true, false, false, 0x57) => Some(CLOSE),
             (true, false, false, 0x46 | 0x48) => Some(FIND),
+            (true, true, false, 0x46) => Some(FIND_FILES),
             (true, false, false, 0x44) => Some(ADD_NEXT),
             (true, true, false, 0x4c) => Some(SELECT_MATCHES),
             (true, true, false, 0x55) => Some(UPPER),
@@ -3795,7 +4798,11 @@ impl App {
             (false, false, false, VK_RETURN)
                 if self.search.visible && unsafe { GetFocus() } == self.search.query =>
             {
-                Some(FIND_NEXT)
+                Some(if self.search.folder_visible {
+                    FIND_FILES_RUN
+                } else {
+                    FIND_NEXT
+                })
             }
             _ => None,
         };
@@ -3835,6 +4842,7 @@ impl App {
     }
     fn tick(&mut self) -> Result<()> {
         self.poll_find_results()?;
+        self.poll_monitor()?;
         while let Ok((revision, result)) = self.recovery.rx.try_recv() {
             self.recovery_busy = false;
             match result {
@@ -4017,6 +5025,10 @@ impl App {
                 self.switch(index)?;
                 self.close_document()?;
             }
+            Event::MoveTab(id, target) => self.reorder_tabs(id, Some(target))?,
+            Event::PinTab(id) => self.reorder_tabs(id, None)?,
+            Event::SplitTab(id) => self.split_tab(id)?,
+            Event::CompareTabs(current, target) => self.compare_tabs(current, target)?,
             Event::Updated(pane) => {
                 self.editors[pane].update_line_number_margin();
                 if pane == self.focused {
@@ -4034,16 +5046,42 @@ impl App {
                     self.update_map_view();
                     if self.comparing && self.secondary.is_some() {
                         let visible = self.editor().send(SCI_GETFIRSTVISIBLELINE, 0, 0);
-                        let source_line = self
-                            .editor()
-                            .send(SCI_DOCLINEFROMVISIBLE, visible as usize, 0)
-                            .max(0) as usize;
-                        let target_line =
-                            core::corresponding_line(&self.differences, source_line, pane == 1);
-                        let other = self.editors[1 - pane];
-                        let line = other.send(SCI_VISIBLEFROMDOCLINE, target_line, 0);
-                        if other.send(SCI_GETFIRSTVISIBLELINE, 0, 0) != line {
-                            other.send(SCI_SETFIRSTVISIBLELINE, line as usize, 0);
+                        if self.compare_options.align {
+                            let virtual_row = if visible <= 0 {
+                                0
+                            } else {
+                                visible as usize + self.compare_leading[pane]
+                            };
+                            let mut resized = false;
+                            for side in 0..2 {
+                                let top = self.compare_leading[side].saturating_sub(virtual_row);
+                                resized |= self.compare_top[side] != top;
+                                self.compare_top[side] = top;
+                                if side != pane {
+                                    let target =
+                                        virtual_row.saturating_sub(self.compare_leading[side]);
+                                    if self.editors[side].send(SCI_GETFIRSTVISIBLELINE, 0, 0)
+                                        != target as isize
+                                    {
+                                        self.editors[side].send(SCI_SETFIRSTVISIBLELINE, target, 0);
+                                    }
+                                }
+                            }
+                            if resized {
+                                self.layout();
+                            }
+                        } else {
+                            let source_line = self
+                                .editor()
+                                .send(SCI_DOCLINEFROMVISIBLE, visible as usize, 0)
+                                .max(0) as usize;
+                            let target_line =
+                                core::corresponding_line(&self.differences, source_line, pane == 1);
+                            let other = self.editors[1 - pane];
+                            let line = other.send(SCI_VISIBLEFROMDOCLINE, target_line, 0);
+                            if other.send(SCI_GETFIRSTVISIBLELINE, 0, 0) != line {
+                                other.send(SCI_SETFIRSTVISIBLELINE, line as usize, 0);
+                            }
                         }
                     }
                     self.update_status();
@@ -4054,7 +5092,7 @@ impl App {
                 if self.editors[pane].length() > core::MAX_DOCUMENT_BYTES {
                     self.editors[pane].send(SCI_UNDO, 0, 0);
                     return Err(
-                        "The edit was undone because it exceeded the 128 MiB document limit."
+                        "The edit was undone because it exceeded the 256 MiB document limit."
                             .into(),
                     );
                 }
@@ -4086,12 +5124,20 @@ impl App {
                     self.schedule_json();
                 }
                 if self.comparing {
-                    for editor in self.editors {
-                        editor.clear_diff();
+                    if self.compare_ranges.is_some() {
+                        self.clear_compare();
+                        self.note="Selected-line comparison ended after the edit; reselect lines to compare again.".into();
+                    } else {
+                        for editor in self.editors {
+                            editor.clear_diff();
+                        }
+                        self.compare_leading = [0; 2];
+                        self.compare_top = [0; 2];
+                        self.layout();
+                        self.differences.clear();
+                        self.compare_due = Some(Instant::now() + Duration::from_millis(350));
+                        self.note = "Updating comparison...".into();
                     }
-                    self.differences.clear();
-                    self.compare_due = Some(Instant::now() + Duration::from_millis(350));
-                    self.note = "Updating comparison...".into();
                 }
                 self.touch();
                 if tab_changed {
@@ -4352,6 +5398,13 @@ pub fn run() -> Result<()> {
                 word: null_mut(),
                 buttons: Vec::new(),
                 visible: false,
+                directory: null_mut(),
+                filters: null_mut(),
+                recursive: null_mut(),
+                hidden: null_mut(),
+                folder_labels: [null_mut(); 2],
+                folder_buttons: Vec::new(),
+                folder_visible: false,
             },
             results: ResultPanel::new(result_editor),
             documents: Vec::new(),
@@ -4365,6 +5418,15 @@ pub fn run() -> Result<()> {
             theme: session.theme.clone(),
             editor_font: session.editor_font,
             show_symbols: session.show_symbols,
+            monitor_files: session.monitor_files,
+            monitor: Monitor::new(),
+            monitor_busy: false,
+            monitor_last: Instant::now(),
+            compare_options: session.compare_options,
+            compare_generation: 0,
+            compare_ranges: None,
+            compare_leading: [0; 2],
+            compare_top: [0; 2],
             font: null_mut(),
             dpi: GetDpiForWindow(hwnd),
             map_visible: false,
@@ -4405,6 +5467,15 @@ pub fn run() -> Result<()> {
             app.add_document(snapshot)?;
         }
         if !app.documents.is_empty() {
+            let active_id = app.documents[active.min(app.documents.len() - 1)]
+                .snapshot
+                .id;
+            app.documents.sort_by_key(|doc| !doc.snapshot.pinned);
+            let active = app
+                .documents
+                .iter()
+                .position(|doc| doc.snapshot.id == active_id)
+                .expect("restored active tab");
             app.switch(active.min(app.documents.len() - 1))?;
         }
         for path in paths {

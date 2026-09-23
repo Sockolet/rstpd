@@ -9,7 +9,8 @@ use std::{
 use unicode_segmentation::UnicodeSegmentation;
 
 pub type Result<T> = std::result::Result<T, String>;
-pub const MAX_DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_SEARCH_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_TOOL_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +169,7 @@ impl Encoding {
 
 pub fn decode(bytes: &[u8], override_encoding: Option<&Encoding>) -> Result<(String, Encoding)> {
     if bytes.len() > MAX_DOCUMENT_BYTES {
-        return Err("Files over 128 MiB are not supported.".into());
+        return Err("Files over 256 MiB are not supported.".into());
     }
     let encoding = override_encoding.cloned().unwrap_or_else(|| {
         if bytes.starts_with(b"\xff\xfe\0\0") {
@@ -252,7 +253,7 @@ pub fn decode(bytes: &[u8], override_encoding: Option<&Encoding>) -> Result<(Str
         }
     };
     if text.len() > MAX_DOCUMENT_BYTES {
-        return Err("Decoded text exceeds the 128 MiB document limit.".into());
+        return Err("Decoded text exceeds the 256 MiB document limit.".into());
     }
     Ok((text, encoding))
 }
@@ -571,6 +572,7 @@ impl Search {
         Ok(Self { regex, mode })
     }
     pub fn find(&self, text: &str, start: usize) -> Result<Option<Range<usize>>> {
+        Self::validate_size(text.len())?;
         let start = start.min(text.len());
         let mut boundary = start;
         while !text.is_char_boundary(boundary) {
@@ -603,7 +605,8 @@ impl Search {
         text: &str,
         mut visit: impl FnMut(Range<usize>) -> Result<bool>,
     ) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        Self::validate_size(text.len())?;
+        let deadline = Instant::now() + Self::time_budget(text.len());
         for m in self.regex.find_iter(text) {
             if Instant::now() > deadline {
                 return Err(
@@ -622,11 +625,9 @@ impl Search {
         range: Range<usize>,
         replacement: &str,
     ) -> Result<String> {
-        if text.len() > MAX_TOOL_BYTES || replacement.len() > 32 * 1024 {
-            return Err(
-                "Replacement is limited to 16 MiB of text and a 32 KiB replacement expression."
-                    .into(),
-            );
+        Self::validate_size(text.len())?;
+        if replacement.len() > 32 * 1024 {
+            return Err("Replacement expressions are limited to 32 KiB.".into());
         }
         let replacement = if self.mode == SearchMode::Extended {
             unescape(replacement)?
@@ -648,7 +649,7 @@ impl Search {
     }
     pub fn replace_all(&self, text: &str, replacement: &str) -> Result<(String, usize)> {
         let matches = self.matches(text)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Self::time_budget(text.len());
         let mut out = String::new();
         let mut previous = 0;
         for range in &matches {
@@ -659,7 +660,7 @@ impl Search {
             }
             let piece = self.replacement(text, range.clone(), replacement)?;
             if out.len() + range.start - previous + piece.len() > MAX_DOCUMENT_BYTES {
-                return Err("Replacement would exceed the 128 MiB document limit.".into());
+                return Err("Replacement would exceed the 256 MiB document limit.".into());
             }
             out.push_str(&text[previous..range.start]);
             out.push_str(&piece);
@@ -670,6 +671,17 @@ impl Search {
         }
         out.push_str(&text[previous..]);
         Ok((out, matches.len()))
+    }
+    pub fn validate_size(length: usize) -> Result<()> {
+        if length > MAX_SEARCH_BYTES {
+            return Err(
+                "Search and replace are limited to 128 MiB of decoded text per document.".into(),
+            );
+        }
+        Ok(())
+    }
+    fn time_budget(length: usize) -> Duration {
+        Duration::from_secs(2 * length.div_ceil(16 * 1024 * 1024).max(1) as u64)
     }
 }
 

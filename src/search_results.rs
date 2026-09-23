@@ -1,4 +1,4 @@
-use crate::core::{Highlight, MAX_TOOL_BYTES, Result, Search};
+use crate::core::{Highlight, Result, Search};
 use std::{
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
@@ -6,7 +6,7 @@ use std::{
 };
 
 pub const MAX_HITS: usize = 10_000;
-pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 pub const MATCH_INDICATOR: usize = 24;
 
 pub struct Input {
@@ -29,12 +29,15 @@ pub struct FileResults {
     pub revision: u64,
     pub title: String,
     pub hits: Vec<Hit>,
+    pub source: Option<crate::folder_search::DiskSource>,
 }
 pub struct Results {
     pub query: String,
     pub files: Vec<FileResults>,
     pub searched: usize,
     pub truncated: bool,
+    pub skipped: usize,
+    pub warnings: Vec<String>,
 }
 pub struct Link {
     pub file: usize,
@@ -160,21 +163,24 @@ pub fn find_all(
     inputs: Vec<Input>,
     cancelled: &AtomicBool,
 ) -> Result<Results> {
-    if inputs
+    let Some(bytes) = inputs
         .iter()
         .try_fold(0usize, |total, input| total.checked_add(input.text.len()))
-        .is_none_or(|total| total > MAX_BATCH_BYTES)
-    {
-        return Err("Find All is limited to 64 MiB across the selected open documents.".into());
-    }
+        .filter(|total| *total <= MAX_BATCH_BYTES)
+    else {
+        return Err("Find All is limited to 256 MiB across the selected open documents.".into());
+    };
     let mut result = Results {
         query,
         files: Vec::new(),
         searched: 0,
         truncated: false,
+        skipped: 0,
+        warnings: Vec::new(),
     };
     let mut total = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline =
+        Instant::now() + Duration::from_secs(10 * bytes.div_ceil(64 * 1024 * 1024).max(1) as u64);
     for input in inputs {
         if cancelled.load(Ordering::Relaxed) {
             return Err("Search cancelled.".into());
@@ -182,14 +188,14 @@ pub fn find_all(
         if Instant::now() > deadline {
             return Err("Find All exceeded its processing budget. Narrow the search.".into());
         }
-        if input.text.len() > MAX_TOOL_BYTES {
-            return Err(format!("{} exceeds the 16 MiB search limit.", input.title));
-        }
+        Search::validate_size(input.text.len())
+            .map_err(|error| format!("{}: {error}", input.title))?;
         let mut file = FileResults {
             id: input.id,
             revision: input.revision,
             title: input.title,
             hits: Vec::new(),
+            source: None,
         };
         let mut cursor = LineCursor::new(&input.text, input.tab_width);
         search.visit_matches(&input.text, |range| {
@@ -228,7 +234,7 @@ impl Results {
     }
     pub fn summary(&self) -> String {
         let count = self.count();
-        if self.truncated {
+        let summary = if self.truncated {
             format!(
                 "Showing the first {} matches; more results exist. Narrow the search.",
                 count
@@ -246,6 +252,11 @@ impl Results {
                 },
                 self.searched
             )
+        };
+        if self.skipped == 0 {
+            summary
+        } else {
+            format!("{summary}; {} skipped (see warnings)", self.skipped)
         }
     }
     pub fn render(&self) -> Rendered {
@@ -279,6 +290,16 @@ impl Results {
             1,
             0x400,
         );
+        for warning in &self.warnings {
+            line(
+                &mut text,
+                &mut styles,
+                &mut folds,
+                &format!("Skipped: {}", single_line(warning, 240)),
+                0,
+                0x400,
+            );
+        }
         for (index, file) in self.files.iter().enumerate() {
             line(
                 &mut text,

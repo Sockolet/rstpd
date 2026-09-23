@@ -1,6 +1,6 @@
 #![cfg(windows)]
 use rstpd::{
-    core::EditorFont,
+    core::{EditorFont, MAX_DOCUMENT_BYTES},
     editor::{self, Editor, Palette, sci::*},
     languages,
 };
@@ -193,6 +193,38 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
         assert_ne!(left.send(SCI_INDICATORVALUEAT, 20, 1), 0);
         left.clear_diff();
         assert_eq!(left.send(SCI_INDICATORVALUEAT, 20, 1), 0);
+        let text_before_padding = left.text().unwrap();
+        let modified_before_padding = left.send(SCI_GETMODIFY, 0, 0);
+        assert_eq!(
+            left.apply_compare_padding(&[
+                rstpd::comparison::Padding {
+                    before: 0,
+                    count: 2
+                },
+                rstpd::comparison::Padding {
+                    before: 1,
+                    count: 3
+                },
+            ])
+            .unwrap(),
+            2
+        );
+        assert_eq!(left.send(SCI_ANNOTATIONGETLINES, 0, 0), 3);
+        assert_eq!(left.text().unwrap(), text_before_padding);
+        assert_eq!(left.send(SCI_GETMODIFY, 0, 0), modified_before_padding);
+        left.send(SCI_MARKERADD, 0, 22);
+        assert_ne!(left.send(SCI_MARKERGET, 0, 0) & (1 << 22), 0);
+        left.clear_diff();
+        assert_eq!(left.send(SCI_ANNOTATIONGETLINES, 0, 0), 0);
+        assert_eq!(left.send(SCI_MARKERGET, 0, 0) & (1 << 22), 0);
+        let line = "x".repeat(1023) + "\n";
+        let large_text = line.repeat(MAX_DOCUMENT_BYTES / line.len());
+        left.set_text(&large_text).unwrap();
+        assert_eq!(left.length(), MAX_DOCUMENT_BYTES);
+        assert_eq!(right.length(), MAX_DOCUMENT_BYTES);
+        assert!(left.replace(left.length()..left.length(), "x").is_err());
+        left.set_text(&text_before_padding).unwrap();
+        drop(large_text);
         left.clear_styles();
         assert_eq!(left.send(SCI_GETENDSTYLED, 0, 0) as usize, left.length());
         assert_eq!(left.send(SCI_GETSTYLEAT, text.find("say").unwrap(), 0), 0);

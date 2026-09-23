@@ -1,4 +1,4 @@
-param([string]$Executable = "$PSScriptRoot\..\target\debug\rstpd.exe")
+param([string]$Executable = "$PSScriptRoot\..\target\debug\rstpd.exe", [switch]$WorkflowsOnly, [switch]$LargeFilesOnly)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
@@ -22,6 +22,49 @@ public static class RstpdSmoke {
     [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int width, int height, bool redraw);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetMenuString(IntPtr menu, uint item, StringBuilder text, int count, uint flags);
+    public static void Click(IntPtr target, int packedPoint, int count) {
+        for(int i=0;i<count;i++) {
+            if(!PostMessage(target,(i%2==0)?0x201u:0x203u,(IntPtr)1,(IntPtr)packedPoint) ||
+               !PostMessage(target,0x202,IntPtr.Zero,(IntPtr)packedPoint))
+                throw new InvalidOperationException("Mouse click messages were not delivered.");
+            System.Threading.Thread.Sleep(50);
+        }
+        System.Threading.Thread.Sleep(200);
+    }
+    public static void DoubleClick(IntPtr target, int packedPoint) {
+        foreach(uint message in new uint[]{0x201,0x202,0x203,0x202})
+            if(!PostMessage(target,message,(IntPtr)((message==0x202)?0:1),(IntPtr)packedPoint))
+                throw new InvalidOperationException("Double-click messages were not delivered.");
+        System.Threading.Thread.Sleep(200);
+    }
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow callback, IntPtr state);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumWindow callback, IntPtr state);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr window);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window, StringBuilder text, int count);
+    delegate bool EnumWindow(IntPtr window, IntPtr state);
+    public static IntPtr Dialog(int process) {return OwnedWindow(process,"#32770");}
+    public static IntPtr Popup(int process) {return OwnedWindow(process,"#32768");}
+    static IntPtr OwnedWindow(int process, string className) {
+        IntPtr found=IntPtr.Zero;
+        EnumWindows((window,state)=>{
+            uint owner; GetWindowThreadProcessId(window,out owner);
+            var name=new StringBuilder(128); GetClassName(window,name,128);
+            if(owner==process && name.ToString()==className && IsWindowVisible(window)) {found=window;return false;}
+            return true;
+        },IntPtr.Zero);
+        return found;
+    }
+    public static string DialogText(IntPtr dialog) {
+        var output=new StringBuilder();
+        EnumChildWindows(dialog,(window,state)=>{
+            var text=new StringBuilder(4096);GetWindowText(window,text,text.Capacity);
+            output.Append(GetDlgCtrlID(window)).Append(": ").Append(text).Append(" | ");return true;
+        },IntPtr.Zero);
+        return output.ToString();
+    }
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int left, top, right, bottom; }
 }
 '@
@@ -32,6 +75,10 @@ $firstSessionDirectory = Join-Path $firstProfile 'rstpd'
 $firstSession = Join-Path $firstSessionDirectory 'session.json'
 $legacySessionDirectory = Join-Path $firstProfile 'RSTPad'
 $legacySession = Join-Path $legacySessionDirectory 'session.json'
+$workflowDirectory=Join-Path $directory 'workflows'
+$workflowSession=Join-Path $workflowDirectory 'session'
+$largeDirectory=Join-Path $directory 'large-search'
+$largeSession=Join-Path $largeDirectory 'state'
 New-Item -ItemType Directory $directory | Out-Null
 Copy-Item "$root\tests\fixtures\before.json" (Join-Path $directory 'before.json')
 Copy-Item "$root\tests\fixtures\after.json" (Join-Path $directory 'after.json')
@@ -121,6 +168,212 @@ function Caption([IntPtr]$handle) {
     [RstpdSmoke]::GetWindowText($handle,$text,$text.Capacity) | Out-Null
     $text.ToString()
 }
+function Dismiss-WorkflowDialog([string]$phase) {
+    try {Wait-Until {
+        $dialog=[RstpdSmoke]::Dialog($script:process.Id)
+        $dialog -ne [IntPtr]::Zero -and (
+            [RstpdSmoke]::GetDlgItem($dialog,7) -ne [IntPtr]::Zero -or
+            [RstpdSmoke]::GetDlgItem($dialog,1) -ne [IntPtr]::Zero -or
+            [RstpdSmoke]::GetDlgItem($dialog,2) -ne [IntPtr]::Zero
+        )
+    } 'Expected a fully initialized conflict/error dialog.'}
+    catch {throw "$phase dialog unavailable: $([RstpdSmoke]::DialogText([RstpdSmoke]::Dialog($script:process.Id)))"}
+    $dialog=[RstpdSmoke]::Dialog($script:process.Id)
+    $no=[RstpdSmoke]::GetDlgItem($dialog,7)
+    $button=if($no -ne [IntPtr]::Zero){$no}else{[RstpdSmoke]::GetDlgItem($dialog,1)}
+    if($button -eq [IntPtr]::Zero){$button=[RstpdSmoke]::GetDlgItem($dialog,2)}
+    Assert ($button -ne [IntPtr]::Zero) "$phase dialog has no expected response button."
+    [RstpdSmoke]::PostMessage($button,0xF5,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+    try {Wait-Until { [RstpdSmoke]::Dialog($script:process.Id) -eq [IntPtr]::Zero } 'Dialog did not close.'}
+    catch {throw "$phase dialog did not close: $([RstpdSmoke]::DialogText([RstpdSmoke]::Dialog($script:process.Id)))"}
+}
+function Tab-Point([int]$index) {
+    $scale=[RstpdSmoke]::GetDpiForWindow($script:window)/96
+    ([int](16*$scale) -shl 16) -bor [int]((95+$index*190)*$scale)
+}
+function Select-Tab([int]$index) {
+    Number (Control 302) 0x201 1 (Tab-Point $index) | Out-Null
+    Number (Control 302) 0x202 0 (Tab-Point $index) | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+function Tab-Menu([int]$index,[int]$action) {
+    $title=Caption $script:window
+    [RstpdSmoke]::PostMessage((Control 302),0x204,[IntPtr]2,[IntPtr](Tab-Point $index)) | Out-Null
+    [RstpdSmoke]::PostMessage((Control 302),0x205,[IntPtr]::Zero,[IntPtr](Tab-Point $index)) | Out-Null
+    Wait-Until { [RstpdSmoke]::Popup($script:process.Id) -ne [IntPtr]::Zero } 'Tab context menu did not open.'
+    $popup=[RstpdSmoke]::Popup($script:process.Id)
+    $menu=[IntPtr](Number $popup 0x1E1)
+    Assert ($menu -ne [IntPtr]::Zero) 'Tab popup did not expose its native menu.'
+    foreach ($entry in @(@(1504,'Open in split view'),@(1505,'Compare with current view'))) {
+        $label=[Text.StringBuilder]::new(128)
+        [RstpdSmoke]::GetMenuString($menu,$entry[0],$label,$label.Capacity,0) | Out-Null
+        Assert ($label.ToString() -eq $entry[1]) "Missing context action: $($entry[1])"
+    }
+    Assert ((Caption $script:window) -eq $title) 'Right-click changed the active document.'
+    if($action -eq 0){
+        Assert (([RstpdSmoke]::GetMenuState($menu,1505,0) -band 3) -ne 0) 'Self-comparison must be disabled.'
+        [RstpdSmoke]::PostMessage($popup,0x100,[IntPtr]0x1B,[IntPtr]::Zero) | Out-Null
+    }else{
+        for($step=0;$step -lt [RstpdSmoke]::GetMenuItemCount($menu)+1;$step++){
+            if(([RstpdSmoke]::GetMenuState($menu,$action,0) -band 128) -ne 0){break}
+            [RstpdSmoke]::PostMessage($popup,0x100,[IntPtr]0x28,[IntPtr]::Zero) | Out-Null
+            Start-Sleep -Milliseconds 60
+        }
+        Assert (([RstpdSmoke]::GetMenuState($menu,$action,0) -band 128) -ne 0) 'Could not select the requested context action.'
+        [RstpdSmoke]::PostMessage($popup,0x100,[IntPtr]0x0D,[IntPtr]::Zero) | Out-Null
+    }
+    Wait-Until { [RstpdSmoke]::Popup($script:process.Id) -eq [IntPtr]::Zero } 'Tab context menu did not close.'
+    Start-Sleep -Milliseconds 250
+}
+function Editor-Text([int]$id) {
+    $editor=Control $id
+    [Text.Encoding]::UTF8.GetString([byte[]]@(for($position=0;$position -lt (Number $editor 2006);$position++){Number $editor 2007 $position}))
+}
+function Check-Workflows {
+    New-Item -ItemType Directory $workflowDirectory | Out-Null
+    $alpha=Join-Path $workflowDirectory 'alpha.txt'
+    $beta=Join-Path $workflowDirectory 'beta.txt'
+    $disk=Join-Path $workflowDirectory 'disk-only.txt'
+    [IO.File]::WriteAllText($alpha,"anchor`nsecond`n")
+    [IO.File]::WriteAllText($beta,"second`nanchor`n")
+    [IO.File]::WriteAllText($disk,"needle cafe needle`n")
+    Start-Editor $false $false @('--session-dir',$workflowSession,$alpha,$beta)
+    Assert ((Number (Control 302) 0x1304) -eq 2) 'Workflow fixture did not open two tabs.'
+    Command 1500
+    Assert ((Number (Control 302) 0x130B) -eq 0) 'Pinning did not move the active tab left.'
+    Assert ((Caption $script:window) -match '^beta.txt') 'Pinning changed the active document.'
+    Command 1502
+    Assert ((Number (Control 302) 0x130B) -eq 0) 'Pinned tab crossed into the unpinned group.'
+    Command 1500
+    Command 1502
+    Assert ((Number (Control 302) 0x130B) -eq 1) 'Move-right command did not reorder the tab.'
+    Number (Control 302) 0x201 1 (Tab-Point 1) | Out-Null
+    Number (Control 302) 0x200 1 (Tab-Point 0) | Out-Null
+    Number (Control 302) 0x202 0 (Tab-Point 0) | Out-Null
+    Wait-Until { (Number (Control 302) 0x130B) -eq 0 } 'Dragging did not reorder tabs.'
+    Command 1500
+    Command 1001
+    Select-Tab 0
+    Number (Control 101) 2160 1 4 | Out-Null
+    Tab-Menu 1 1504
+    Assert ([RstpdSmoke]::IsWindowVisible((Control 102))) 'Open in split view did not open the other pane.'
+    Assert ((Editor-Text 101) -eq "second`nanchor`n" -and (Editor-Text 102) -eq "anchor`nsecond`n") 'Split context action did not preserve the current document and open the clicked one.'
+    Assert ((Number (Control 101) 2143) -eq 1 -and (Number (Control 101) 2145) -eq 4) 'Split context action lost the active selection.'
+    [RstpdSmoke]::PostMessage((Control 101),0x100,[IntPtr]117,[IntPtr]::Zero) | Out-Null
+    Wait-Until { (Caption $script:window) -match '^alpha.txt' } 'Could not activate the right pane.'
+    Tab-Menu 2 1504
+    Assert ((Editor-Text 101) -eq '' -and (Editor-Text 102) -eq "anchor`nsecond`n") 'Open in split view did not replace the other pane while the right pane was active.'
+    Assert ((Caption $script:window) -match '^alpha.txt') 'Opening a split changed the active right-hand document.'
+    Tab-Menu 0 1505
+    Wait-Until { ((Number (Control 101) 2046 0) -bor (Number (Control 101) 2046 1)) -ne 0 } 'Context comparison did not complete.'
+    Assert ((Editor-Text 101) -eq "anchor`nsecond`n" -and (Editor-Text 102) -eq "second`nanchor`n") 'Compare with current view did not compare the previously active right pane with the clicked tab.'
+    Assert ((Number (Control 302) 0x1304) -eq 3) 'Context actions duplicated document tabs.'
+    Tab-Menu 1 0
+    Tab-Menu 0 1504
+    Assert (((Number (Control 101) 2046 0) -band ((1-shl 20)-bor(1-shl 21)-bor(1-shl 22))) -eq 0) 'Opening a normal split left stale comparison marks.'
+    Command 1050
+    Select-Tab 2
+    Command 1005
+    Select-Tab 0
+    $scale=[RstpdSmoke]::GetDpiForWindow($script:window)/96
+    $blank=([int](16*$scale) -shl 16) -bor [int](390*$scale)
+    $tabRect=[RstpdSmoke+Rect]::new()
+    [RstpdSmoke]::GetWindowRect((Control 302),[ref]$tabRect) | Out-Null
+    $screenBlank=(($tabRect.top+[int](16*$scale)) -shl 16) -bor (($tabRect.left+[int](390*$scale)) -band 0xffff)
+    $hit=Number (Control 302) 0x84 0 $screenBlank
+    Assert ($hit -eq 1) "Empty tab space is not mouse-hit-testable (WM_NCHITTEST returned $hit instead of HTCLIENT)."
+    [RstpdSmoke]::Click((Control 302),(Tab-Point 0),2)
+    Assert ((Number (Control 302) 0x1304) -eq 2) 'Double-clicking a tab label created a document.'
+    [RstpdSmoke]::Click((Control 302),$blank,1)
+    Assert ((Number (Control 302) 0x1304) -eq 2) 'Single-clicking empty tab space created a document.'
+    Start-Sleep -Milliseconds ([RstpdSmoke]::GetDoubleClickTime()+50)
+    [RstpdSmoke]::Click((Control 302),$blank,2)
+    Wait-Until { (Number (Control 302) 0x1304) -eq 3 } 'Double-click after the last tab did not create an untitled document.'
+    Assert ((Number (Control 101) 2006) -eq 0) 'Double-click-created tab was not empty.'
+    Command 1005
+    [RstpdSmoke]::DoubleClick((Control 302),$blank)
+    Wait-Until { (Number (Control 302) 0x1304) -eq 3 } 'A Windows-recognized double-click was lost in the message loop.'
+    Command 1005
+    Select-Tab 1
+    Number (Control 101) 2160 2 6 | Out-Null
+    [IO.File]::WriteAllText($alpha,"external text`n")
+    Wait-Until { (Number (Control 101) 2006) -eq 14 -and (Caption (Control 303)) -match 'Reloaded external' } 'Clean tab did not automatically reload.'
+    Assert ((Number (Control 101) 2143) -eq 2 -and (Number (Control 101) 2145) -eq 6) 'External reload lost the selection.'
+    Assert ((Number (Control 101) 2159) -eq 0) 'Automatic reload marked the buffer modified.'
+    Command 1503
+    [IO.File]::WriteAllText($alpha,"monitor paused`n")
+    Start-Sleep -Milliseconds 1200
+    Assert ((Number (Control 101) 2006) -eq 14) 'Disabled monitoring reloaded a file.'
+    Command 1503
+    Wait-Until { (Number (Control 101) 2006) -eq 15 } 'Re-enabling monitoring did not refresh a changed file.'
+    [IO.File]::WriteAllText($alpha,"external text`n")
+    Wait-Until { (Number (Control 101) 2006) -eq 14 } 'Monitoring did not resume normally.'
+    Number (Control 101) 2078 | Out-Null
+    Type-Text 'local'
+    Number (Control 101) 2079 | Out-Null
+    $editedLength=Number (Control 101) 2006
+    [IO.File]::WriteAllText($alpha,"next external text`n")
+    Dismiss-WorkflowDialog 'External reload'
+    Assert ((Number (Control 101) 2006) -eq $editedLength) 'Declining reload discarded unsaved edits.'
+    Command 1003
+    Dismiss-WorkflowDialog 'Save conflict'
+    Assert ([IO.File]::ReadAllText($alpha) -eq "next external text`n") 'Declined save overwrote an external change.'
+    Command 1010
+    Assert ((Number (Control 101) 2159) -eq 0) 'Undo did not return the monitored document to its save point.'
+    [IO.File]::WriteAllText($alpha,"fresh external text`n")
+    Wait-Until { (Number (Control 101) 2006) -eq 20 } 'Monitoring did not resume after an external conflict.'
+    Command 1180
+    [RstpdSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'needle') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 410),0x0c,[IntPtr]::Zero,$workflowDirectory) | Out-Null
+    [RstpdSmoke]::SendMessage((Control 411),0x0c,[IntPtr]::Zero,'disk-only.txt') | Out-Null
+    Command 1181
+    Wait-Until { (Caption (Control 305)) -match '^2 matches in 1 document' } 'Find in Files did not return matches from a closed file.'
+    Command 1173
+    Assert ((Caption $script:window) -match '^disk-only.txt') 'A disk result did not open its file.'
+    Assert ((Number (Control 101) 2143) -eq 0 -and (Number (Control 101) 2145) -eq 6) 'Disk-result navigation was not exact.'
+    Number (Control 101) 2078 | Out-Null
+    Type-Text 'unsaved edits'
+    Number (Control 101) 2079 | Out-Null
+    $editedLength=Number (Control 101) 2006
+    Command 1173
+    Dismiss-WorkflowDialog 'Disk result'
+    Assert ((Number (Control 101) 2006) -eq $editedLength) 'Disk result replaced a dirty buffer.'
+    Command 1010
+    Command 1160
+    Command 1176
+    Command 1001
+    Type-Text "first`nsecond`nthird`n"
+    Command 1001
+    Type-Text "third`nfirst`nsecond`n"
+    Command 1501
+    Command 1070
+    Wait-Until { ((Number (Control 101) 2046 0) -band (1 -shl 22)) -ne 0 -and ((Number (Control 102) 2046 2) -band (1 -shl 22)) -ne 0 } 'Comparison did not detect moved lines.'
+    Assert ((Number (Control 101) 2006) -eq 19 -and (Number (Control 102) 2006) -eq 19) 'Comparison inserted spacer text into documents.'
+    $leftRect=[RstpdSmoke+Rect]::new();$rightRect=[RstpdSmoke+Rect]::new()
+    [RstpdSmoke]::GetWindowRect((Control 101),[ref]$leftRect) | Out-Null
+    [RstpdSmoke]::GetWindowRect((Control 102),[ref]$rightRect) | Out-Null
+    Assert ($rightRect.top -gt $leftRect.top) 'Leading inserted lines are not visually aligned.'
+    Number (Control 101) 2160 0 5 | Out-Null
+    Number (Control 102) 2160 13 18 | Out-Null
+    Command 1510
+    Wait-Until { (Caption (Control 303)) -match '^.*0 difference groups' } 'Selected-line comparison included unselected text.'
+    Command 1073
+    Select-Tab 1
+    Type-Text 'unsaved'
+    Command 1512
+    Wait-Until { [RstpdSmoke]::IsWindowVisible((Control 102)) -and (Caption (Control 303)) -match 'difference groups|Difference \d+ of \d+' } 'Last-saved comparison did not complete.'
+    Assert ((Number (Control 102) 2006) -eq 20) 'Last-saved comparison did not use disk contents.'
+    Assert ([IO.File]::ReadAllText($alpha) -eq "fresh external text`n") 'Comparison changed the original file.'
+    Close-Editor
+    $saved=Get-Content (Join-Path $workflowSession 'session.json') -Raw | ConvertFrom-Json
+    Assert ($saved.documents[0].title -eq 'beta.txt' -and $saved.documents[0].pinned) 'Pinned order was not persisted.'
+    Assert ($saved.monitor_files -and $saved.compare_options.align -and $saved.compare_options.detect_moves) 'Workflow preferences were not persisted.'
+    Start-Editor $false $false @('--session-dir',$workflowSession)
+    Select-Tab 0
+    Command 1502
+    Assert ((Number (Control 302) 0x130B) -eq 0) 'Restored pinned tab no longer stayed left.'
+    Close-Editor
+}
 function Check-LanguageMenu([bool]$custom) {
     $menu=[RstpdSmoke]::GetSubMenu([RstpdSmoke]::GetMenu($script:window),5)
     Assert ($menu -ne [IntPtr]::Zero) 'Language menu is missing.'
@@ -152,6 +405,54 @@ function Check-LanguageMenu([bool]$custom) {
         Assert ($sorted[$index] -eq 2000+$index) 'A language command is missing, duplicated or misnumbered.'
     }
     Assert ([RstpdSmoke]::GetMenuItemID($menu,$count-3) -eq 1400) 'Language management commands are not at the bottom.'
+}
+function Check-LargeFileSearch {
+    New-Item -ItemType Directory $largeDirectory | Out-Null
+    $path=Join-Path $largeDirectory 'large.log'
+    $size=50*1024*1024
+    $line=('ordinary log entry'.PadRight(127,'x'))+"`n"
+    $chunk=[Text.Encoding]::UTF8.GetBytes($line*8192)
+    $marker=[Text.Encoding]::UTF8.GetBytes("SEARCH-98765`n")
+    $last=$size-$marker.Length
+    $stream=[IO.File]::Create($path)
+    try {
+        for($block=0;$block -lt 50;$block++){$stream.Write($chunk,0,$chunk.Length)}
+        $stream.Position=0;$stream.Write($marker,0,$marker.Length)
+        $stream.Position=$last;$stream.Write($marker,0,$marker.Length)
+    }finally{$stream.Dispose()}
+    Start-Editor $false $false @('--session-dir',$largeSession,$path)
+    Wait-Until { (Number (Control 101) 2006) -eq $size } 'The 50MiB log did not open.'
+    Command 1040
+    [RstpdSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'SEARCH-98765') | Out-Null
+    Command 1041
+    Wait-Until { (Number (Control 101) 2143) -eq 0 } 'Find Next failed on a 50MiB log.'
+    Command 1041
+    Wait-Until { (Number (Control 101) 2143) -eq $last } 'Find Next did not reach the end of a 50MiB log.'
+    Command 1042
+    Wait-Until { (Number (Control 101) 2143) -eq 0 } 'Find Previous failed on a 50MiB log.'
+    Command 1170
+    Wait-Until { (Caption (Control 305)) -match '^2 matches in 1 document' } 'Find All failed on a 50MiB log.'
+    Command 1173
+    Command 1173
+    Wait-Until { (Number (Control 101) 2143) -eq $last } 'Large-file result navigation was not exact.'
+    [RstpdSmoke]::SendMessage((Control 402),0x0c,[IntPtr]::Zero,'FOUND!-98765') | Out-Null
+    Command 1044
+    Wait-Until { (Number (Control 101) 2007 0) -eq 70 } 'Replace All kept the old 16MiB limit.'
+    Command 1010
+    Wait-Until { (Number (Control 101) 2007 0) -eq 83 } 'Large replacement did not undo.'
+    Command 1180
+    [RstpdSmoke]::SendMessage((Control 401),0x0c,[IntPtr]::Zero,'SEARCH-98765') | Out-Null
+    [RstpdSmoke]::SendMessage((Control 410),0x0c,[IntPtr]::Zero,$largeDirectory) | Out-Null
+    [RstpdSmoke]::SendMessage((Control 411),0x0c,[IntPtr]::Zero,'large.log') | Out-Null
+    Number (Control 412) 0xF1 0 | Out-Null
+    Command 1175
+    Wait-Until { (Caption (Control 305)) -match '^Search results cleared' } 'Could not clear earlier large-file results.'
+    Command 1181
+    Wait-Until { (Caption (Control 305)) -match '^2 matches in 1 document' } 'Directory search failed on a 50MiB log.'
+    Command 1173
+    Command 1173
+    Wait-Until { (Number (Control 101) 2143) -eq $last } 'Large directory-result navigation was not exact.'
+    Close-Editor
 }
 function Check-SearchControls {
     $ids=@(401,402,403,404,405,406,407,408,1041,1042,1043,1044,1160,1170,1171)
@@ -221,6 +522,8 @@ function Screenshot([string]$name) {
 # Scintilla reports physical pixels; mouse messages must use the same DPI context.
 $originalDpiContext=[RstpdSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
 try {
+    if ($WorkflowsOnly) {Check-Workflows; Write-Host 'PASS: New editor workflows.';return}
+    if ($LargeFilesOnly) {Check-LargeFileSearch; Write-Host 'PASS: Native50MiB find/replace, Find All and directory search.';return}
     Start-Editor $false $true
     Assert ((Number (Control 302) 0x1304) -eq 1) 'First launch must create one untitled tab.'
     Assert ((Number (Control 101) 2006) -eq 0) 'First-launch document must be empty.'
@@ -569,20 +872,23 @@ try {
     Command 1173
     Assert ((Caption (Control 305)) -match 'document was closed') 'Closed-tab result navigation did not report stale data.'
     Close-Editor
+    Check-Workflows
+    Check-LargeFileSearch
     Write-Host "PASS: Unicode/selection character counts, visible controls, symbols/preferences, Find All navigation, first launch, recovery and existing editor workflows. Working set: $memory MiB."
+    Write-Host 'PASS: Drag/pin/recovery, queued new-tab double clicks, tab split/compare-current actions, external reload/conflict preservation, Find in Files/navigation, moved/selected/last-saved comparisons and non-editing alignment.'
     Write-Host 'Own-window captures: target\smoke-dark-compare.png, target\smoke-dark-json.png, target\smoke-light-json.png'
 } finally {
     if ($script:process -and !$script:process.HasExited) {
         Stop-Process -Id $script:process.Id
         $script:process.WaitForExit()
     }
-    foreach ($sessionDirectory in @($firstSessionDirectory,$legacySessionDirectory,$directory)) {
-        foreach ($name in @('session.json','session.lock','before.json','after.json','custom-language.xml','sample.rstlang','completion-api.xml','functions.rs','highlighting.md','character-counts.txt')) {
+    foreach ($sessionDirectory in @($firstSessionDirectory,$legacySessionDirectory,$directory,$workflowSession,$workflowDirectory,$largeSession,$largeDirectory)) {
+        foreach ($name in @('session.json','session.lock','before.json','after.json','custom-language.xml','sample.rstlang','completion-api.xml','functions.rs','highlighting.md','character-counts.txt','alpha.txt','beta.txt','disk-only.txt','large.log')) {
             $path = Join-Path $sessionDirectory $name
             if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
         }
     }
-    foreach ($path in @($firstSessionDirectory,$legacySessionDirectory,$firstProfile,$directory)) {
+    foreach ($path in @($largeSession,$largeDirectory,$workflowSession,$workflowDirectory,$firstSessionDirectory,$legacySessionDirectory,$firstProfile,$directory)) {
         if ((Test-Path -LiteralPath $path) -and !(Get-ChildItem -LiteralPath $path -Force)) {
             Remove-Item -LiteralPath $path
         }

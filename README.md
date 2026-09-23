@@ -17,13 +17,13 @@ Download the portable Windows ZIP from the
 [GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\rstpd-1.1.2\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-1.1.2\rstpd.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-1.3.0\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-1.3.0\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\rstpd-1.1.2\rstpd.exe
-.\dist\rstpd-1.1.2\rstpd.exe .\example.rs .\example.json
+.\dist\rstpd-1.3.0\rstpd.exe
+.\dist\rstpd-1.3.0\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
@@ -41,6 +41,8 @@ the new settings.
 | Area | Implementation |
 |---|---|
 | Native UI | Windows title bar, menus, dialogs and controls; DPI-aware Segoe UI chrome, light/dark/system themes, closeable tabs and a compact Lucide icon toolbar |
+| Tab management | Drag to reorder, pin tabs to the left, persist order/pins, and double-click empty space after the last tab to create a document |
+| External changes | Background file monitoring; automatic reload of clean files, explicit confirmation before discarding unsaved edits |
 | Editor font | Native family/size selection, 4-72 pt, saved per workspace and shared by both editing panes and future tabs |
 | Character count | Total characters beside line/column, or selected out of total when text is selected |
 | Show symbols | Independent whitespace, EOL, non-printing/control-character markers, Show All, indentation guides and wrap markers |
@@ -52,7 +54,8 @@ the new settings.
 | Document map | Clickable compact view with the visible text range highlighted; scroll the map for long documents |
 | Search | Normal, extended and advanced regex, including look-ahead/look-behind and pattern backreferences; case/whole-word options, wrap-around and replacement |
 | Find All | Current/all-open-tab searches with grouped matches, highlighted snippets, exact-match navigation and a resizable bottom results panel |
-| Compare | Debounced background comparison, changed-line and inline character highlighting, linked scrolling and difference navigation |
+| Find in Files | Folder, filename filters, optional recursion/hidden files, cancellable background search and navigable disk results |
+| Compare | Live line/character differences, moved-line markers, aligned panes, ignore options, selected-line/clipboard/last-saved comparisons |
 | JSON | Lossless JSON/JSON5 pretty-print/minify, automatically refreshed tree, RFC 6901 pointers and source-span navigation |
 | Text operations | Upper/lower/title/sentence/inverted case; case-sensitive, case-insensitive, natural and exact decimal sorting; reverse/join, deduplication and whitespace operations |
 | Encoding | UTF-8, UTF-16/32 LE/BE, Windows/ISO/OEM code pages, Shift-JIS, EUC-JP, ISO-2022-JP, GBK/GB18030, Big5, EUC-KR, KOI8 and Mac encodings |
@@ -71,6 +74,61 @@ Editing either document automatically schedules a comparison refresh.
 Old worker results are discarded if the documents changed in the meantime;
 refresh does not move your editing caret. EOL representation is ignored during
 line comparison.
+
+### Tabs and external changes
+
+Drag a tab to change its order. Right-click it, or use **File**, to pin/unpin
+or move it left/right. Pinned tabs show `[P]` and stay in the left-hand group;
+dragging cannot cross that boundary. Pinning does not make the file read-only.
+Order and pin state are restored with the workspace. Double-click the unused
+tab-strip area immediately after the last tab to create an empty untitled tab.
+
+The tab context menu also provides **Open in split view**, which opens the
+right-clicked document in the other pane without changing the active document.
+It reuses the existing split if one is open. **Compare with current view**
+compares the document active before the right-click against the clicked tab,
+not the next tab: the current document appears on the left and the clicked
+document on the right. Comparing a tab with itself is disabled. Both actions
+reuse existing documents, including unsaved edits; they do not create copies.
+Opening a normal split clears any active comparison.
+
+**View > Automatically reload external changes** is enabled by default and
+saved per workspace. A background worker polls named tabs about once a second,
+with a periodic content check for same-size/same-timestamp rewrites. Clean
+buffers reload automatically, preserving the visible selection and scroll
+position where possible. Unsaved text or encoding/EOL changes require a
+confirmation; choosing No preserves the buffer and the existing save-conflict
+check. An unchanged rejected disk version is not repeatedly prompted.
+Missing, unreadable or unstable files are reported in the status bar, not
+treated as empty files. This is file refresh, not log-follow/tail mode.
+
+### Comparison options and sources
+
+**Tools > Comparison options** controls whitespace, case and empty-line
+ignoring, moved-line detection and pane alignment. To ignore a regex, enter
+it in the Find field, then choose **Use current Find expression as ignore
+regex**; this always interprets the expression as a regex, independently of
+the Find mode. **Clear ignore regex** removes it. Settings persist with the
+workspace. Ignore options decide which lines differ; inline spans retain
+original character coordinates.
+
+Alignment uses visual annotation rows and leading pane space, never inserted
+document text. Word wrapping is temporarily disabled while aligned and restored
+on clearing comparison. Red/green marks indicate left/right changes; blue marks
+identify matching lines that moved. F7/Shift+F7 navigate difference groups.
+Alignment is capped at 20,000 spacer rows; disable alignment for larger gaps.
+
+**Compare selected lines in both panes** needs two different split documents
+and one selection in each. Selections expand to full lines; editing ends that
+selection comparison, so reselect before comparing again. **Compare with
+clipboard** and **Compare with last saved file** create ordinary untitled
+snapshot tabs; they never save or overwrite the source file. Whole-document
+comparisons continue to refresh after edits.
+
+The independently implemented scope takes behavioral inspiration from
+[ComparePlus](https://github.com/pnedev/comparePlus), not its code. There is no
+plugin loading, Git/SVN comparison, merge operation or multiple simultaneous
+comparison pairs.
 
 Line operations affect complete selected lines, or the whole document when
 there is no selection. Case conversion operates on selected text, including
@@ -180,11 +238,35 @@ documents do not invalidate unaffected matches. Search results are transient
 and are not written to recovery files.
 
 Find All retains at most **10,000 matches** and explicitly reports truncation.
-It accepts up to **16 MiB per document / 64 MiB combined**, with the existing
-per-document regex budget and a ten-second batch budget checked between matches.
+It accepts up to **128 MiB per document / 256 MiB combined**. Match collection
+and replacement phases retain a two-second budget per 16 MiB of input (up to
+16 seconds); Find All allows ten seconds per 64 MiB of combined input (up to
+40 seconds). Budgets are checked between matches, not hard execution deadlines.
 Cancellation is checked between matches/documents, so a running regex evaluation
 may finish before cancellation is acknowledged. A processing failure is shown
 in the panel, not reported as zero matches or a silently partial success.
+
+### Find in Files
+
+Choose **Search > Find in files...** (**Ctrl+Shift+F**) or its Find-panel button.
+Enter the folder, optionally use **Browse...**, and choose filename filters
+such as `*.rs;*.toml;!generated*`. `*` matches any filename characters and `?`
+matches one; spaces or semicolons separate patterns and `!` excludes matches.
+Filters apply to basenames, not directory paths, and are case-insensitive on
+Windows. Empty filters include all filenames. **Subfolders** is initially
+enabled; **Hidden files** is initially disabled.
+
+**Search folder** reuses the Find expression, mode, case and whole-word settings.
+It searches disk contents, not unsaved buffers. Results use the same bottom panel,
+navigation and cancellation controls as Find All. Activating a result verifies
+the file contents before opening/selecting it; changed files or differing
+unsaved buffers are rejected without replacing the buffer.
+
+Binary, oversized, unreadable and linked files are skipped with visible
+warnings. Limits are 128 MiB per file (including decoded UTF-8), 512 MiB total, 10,000 searched files,
+100,000 directory entries, 30 seconds between checks and 10,000 retained matches.
+Regex evaluation or a filesystem read already in progress may delay cancellation.
+This is search only: folder-wide replacement is not implemented.
 
 ## Language definitions and completion
 
@@ -216,8 +298,8 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\rstpd-1.1.2\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-1.1.2\rstpd.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-1.3.0\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-1.3.0\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -250,7 +332,7 @@ word boundaries. Replacement captures use `$1` or `${name}`; `$$` is a
 literal dollar. Look-around and pattern backreferences are supported, for
 example `(?<=prefix:)(\w+)\s+\1(?!x)`. This is not complete Boost/PCRE dialect
 compatibility. Backtracking is limited to 500,000 steps, bulk operations check
-a two-second processing budget, and oversized expansions fail before replacing
+input-scaled processing budgets (two seconds per 16 MiB), and oversized expansions fail before replacing
 the document. Regex errors are reported, not treated as "no match".
 
 ## Recovery and data safety
@@ -286,10 +368,12 @@ Conversions that cannot represent every character are rejected.
 
 ## Deliberate boundaries
 
-- Maximum document size: 128 MiB, including decoded UTF-8 text.
-- Search, line operations and JSON tools: 16 MiB. Compare: 16 MiB combined.
+- Maximum document size: 256 MiB, including decoded UTF-8 text.
+- Find/replace and directory search: 128 MiB per document/file; Find All: 256 MiB combined.
+- Line operations and JSON tools: 16 MiB. Compare: 16 MiB combined.
 - Search/replacement expressions: 32 KiB; capture expansion is size-bounded.
-- Recovery file: 256 MiB; at most 256 tabs. Failed backups are visible in the status bar.
+- Recovery file: 512 MiB; at most 256 tabs. Failed backups are visible in the status bar.
+- Larger files require additional memory for decoding, editor storage, undo and search/recovery snapshots; limits are not a memory-availability guarantee. Older releases may reject recovery files above their former 256 MiB limit.
 - JSON trees: 20,000 nodes and 128 nesting levels. Duplicate
   object keys are rejected to prevent silent data loss. Number spellings and
   object key order are preserved. JSON and JSON5 are supported.
@@ -316,7 +400,7 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-1.1.2-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-1.3.0-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.
