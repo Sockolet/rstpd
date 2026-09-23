@@ -62,14 +62,18 @@ the new settings.
 | Line endings | CRLF, LF and CR conversion |
 | Recovery | Background atomic snapshots of all tabs, including unnamed documents; restore after restart or crash |
 
-To choose documents for a split, click a pane and then choose its tab.
+Each split pane owns its tab bar and independent selection.
 The icon toolbar keeps the same New, Open, Save, Find, Split, Compare, JSON tree
 and Document map actions. Hover for a descriptive tooltip and shortcut.
 Button names remain available to accessibility tools, and keyboard shortcuts
 and menus are unchanged. Icons are drawn natively at the current DPI and
 recolored for light/dark themes; no icon font or browser runtime is required.
-The right-hand document's tab is marked `[R]`. Drag the divider to resize.
-**Compare** compares the active tab with the next tab (wrapping at the end).
+Dark chrome uses restrained panel boundaries, a subdued native-menu separator,
+and spacing between toolbar and tabs. Native menu behavior and light-theme
+rendering are preserved. Drag the visible divider to resize; its wider hit area
+shows a horizontal resize cursor.
+**Compare** compares the selected split documents, or the active tab with the
+next tab when not split (wrapping at the end).
 Editing either document automatically schedules a comparison refresh.
 Old worker results are discarded if the documents changed in the meantime;
 refresh does not move your editing caret. EOL representation is ignored during
@@ -78,17 +82,25 @@ line comparison.
 ### Tabs and external changes
 
 Drag a tab to change its order. Right-click it, or use **File**, to pin/unpin
-or move it left/right. Pinned tabs show `[P]` and stay in the left-hand group;
-dragging cannot cross that boundary. Pinning does not make the file read-only.
+or move it left/right. Pinned tabs show `[P]` and stay before unpinned tabs in
+their pane; dragging cannot cross that boundary. Pinning does not make the file read-only.
 Order and pin state are restored with the workspace. Double-click the unused
 tab-strip area immediately after the last tab to create an empty untitled tab.
 
-The tab context menu also provides **Open in split view**, which opens the
-right-clicked document in the other pane without changing the active document.
-It reuses the existing split if one is open. **Compare with current view**
+The tab context menu provides **Open in split view**, which moves the
+right-clicked tab to the other pane, reusing an existing split.
+**Clone to other pane** explicitly shares the document between both groups.
+New/open use the focused group; Ctrl+Tab cycles within that group, and F6 changes
+panes. Closing a clone removes only that view. Closing a group's last tab
+collapses the empty group; moving its last tab leaves a new blank tab.
+Toggling an existing split off merges both groups without discarding documents.
+Recovery stores both groups, ordering, selections, and focused pane. Older
+recovery files without group metadata open all their documents in the left group.
+
+**Compare with current view**
 compares the document active before the right-click against the clicked tab,
 not the next tab: the current document appears on the left and the clicked
-document on the right. Comparing a tab with itself is disabled. Both actions
+document on the right. Comparing a tab with itself is disabled. These actions
 reuse existing documents, including unsaved edits; they do not create copies.
 Opening a normal split clears any active comparison.
 
@@ -177,7 +189,9 @@ without it use Consolas 11 pt. Invalid stored preferences are reported without
 rewriting recovery data. Theme/language changes and tab switches retain the
 choice. Syntax bold/italic/underline and colors are retained, as are explicit
 UDL font-family and size overrides; the document map stays compact at 2 pt.
-Line-number margins adjust to the font size, zoom and document line count.
+Line-number margins adjust to the font size, zoom and document line count,
+reserving at least two digits with modest font-relative padding rather than a
+fixed minimum width. The separate folding controls remain available.
 The Windows chooser reports names that cannot fit its 31-UTF-16-unit family
 field rather than truncating Unicode names.
 
@@ -424,6 +438,20 @@ session files without accessing your real recovery data. Own-window screenshots
 are written to `target`.
 Markdown checks verify rendered colors/font attributes in light/dark themes,
 live editing, split/map views and recovery, rather than only checking lexer IDs.
+
+`tests\ui_selection.ps1` exercises native pane groups, keyboard navigation,
+move/clone actions, comparison, and recovery with an isolated synthetic session.
+Pass `-ChromeScreenshotDirectory .\target\ui-chrome` to also check native menus
+and theme boundaries. Both UI scripts accept `-Executable` and default to
+`target\release\rstpd.exe`.
+
+`tests\ui_visual.ps1` captures desktop pixels from its own synthetic window and
+rejects missing text or incorrect editor backgrounds. It requires an available
+interactive desktop. On a locked/disconnected desktop, `-NativeCapture
+-GdiDiagnostic` provides a clearly named software-rendering diagnostic only;
+it does not verify normal DirectWrite desktop presentation. Plain PrintWindow
+output is not sufficient visual evidence for DirectWrite views. Captures default
+to `target\ui-visual`, or the supplied `-OutputDirectory`.
 
 ## Source layout and trust boundary
 
