@@ -4996,7 +4996,9 @@ impl App {
                     self.secondary = None;
                     self.focused = 0;
                 } else {
-                    self.split_tab(self.documents[self.index()].snapshot.id)?;
+                    let id = self.documents[self.index()].snapshot.id;
+                    // With a single tab, moving it would leave only a blank tab behind; show it in both panes.
+                    self.transfer_tab(id, self.groups[self.focused].len() == 1)?;
                 }
                 self.normalize_groups();
                 self.refresh_views()?;

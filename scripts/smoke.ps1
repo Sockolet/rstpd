@@ -259,15 +259,13 @@ function Check-Workflows {
     Assert ([RstpdSmoke]::IsWindowVisible((Control 102))) 'Open in split view did not open the other pane.'
     Assert ((Editor-Text 101) -eq "second`nanchor`n" -and (Editor-Text 102) -eq "anchor`nsecond`n") 'Split context action did not preserve the current document and open the clicked one.'
     Assert ((Number (Control 101) 2143) -eq 1 -and (Number (Control 101) 2145) -eq 4) 'Split context action lost the active selection.'
-    [RstpdSmoke]::PostMessage((Control 101),0x100,[IntPtr]117,[IntPtr]::Zero) | Out-Null
-    Wait-Until { (Caption $script:window) -match '^alpha.txt' } 'Could not activate the right pane.'
-    Tab-Menu 2 1504
-    Assert ((Editor-Text 101) -eq '' -and (Editor-Text 102) -eq "anchor`nsecond`n") 'Open in split view did not replace the other pane while the right pane was active.'
-    Assert ((Caption $script:window) -match '^alpha.txt') 'Opening a split changed the active right-hand document.'
+    # Each pane owns its tabs: the clicked tab moves to the right pane's tab bar and takes focus.
+    Assert ((Number (Control 302) 0x1304) -eq 2 -and (Number (Control 306) 0x1304) -eq 1) 'Open in split view did not move the tab to the right pane.'
+    Wait-Until { (Caption $script:window) -match '^alpha.txt' } 'Open in split view did not focus the moved tab.'
     Tab-Menu 0 1505
     Wait-Until { ((Number (Control 101) 2046 0) -bor (Number (Control 101) 2046 1)) -ne 0 } 'Context comparison did not complete.'
     Assert ((Editor-Text 101) -eq "anchor`nsecond`n" -and (Editor-Text 102) -eq "second`nanchor`n") 'Compare with current view did not compare the previously active right pane with the clicked tab.'
-    Assert ((Number (Control 302) 0x1304) -eq 3) 'Context actions duplicated document tabs.'
+    Assert ((Number (Control 302) 0x1304) + (Number (Control 306) 0x1304) -eq 3) 'Context actions duplicated document tabs.'
     Tab-Menu 1 0
     Tab-Menu 0 1504
     Assert (((Number (Control 101) 2046 0) -band ((1-shl 20)-bor(1-shl 21)-bor(1-shl 22))) -eq 0) 'Opening a normal split left stale comparison marks.'
@@ -358,6 +356,8 @@ function Check-Workflows {
     Command 1510
     Wait-Until { (Caption (Control 303)) -match '^.*0 difference groups' } 'Selected-line comparison included unselected text.'
     Command 1073
+    # Collapse the comparison split so tab 1 is clicked on the full-width left tab bar.
+    Command 1050
     Select-Tab 1
     Type-Text 'unsaved'
     Command 1512
@@ -366,9 +366,12 @@ function Check-Workflows {
     Assert ([IO.File]::ReadAllText($alpha) -eq "fresh external text`n") 'Comparison changed the original file.'
     Close-Editor
     $saved=Get-Content (Join-Path $workflowSession 'session.json') -Raw | ConvertFrom-Json
-    Assert ($saved.documents[0].title -eq 'beta.txt' -and $saved.documents[0].pinned) 'Pinned order was not persisted.'
+    Assert ($saved.documents[$saved.pane_documents[0][0]].title -eq 'beta.txt' -and $saved.documents[$saved.pane_documents[0][0]].pinned) 'Pinned order was not persisted.'
     Assert ($saved.monitor_files -and $saved.compare_options.align -and $saved.compare_options.detect_moves) 'Workflow preferences were not persisted.'
     Start-Editor $false $false @('--session-dir',$workflowSession)
+    Assert ([RstpdSmoke]::IsWindowVisible((Control 102))) 'Recovery did not restore the split pane groups.'
+    # Collapse the restored split so tab 0 is clicked on the full-width left tab bar.
+    Command 1050
     Select-Tab 0
     Command 1502
     Assert ((Number (Control 302) 0x130B) -eq 0) 'Restored pinned tab no longer stayed left.'
@@ -612,14 +615,16 @@ try {
     Command 1306
     Command 1050
     Assert ((Number (Control 102) 2020) -eq 1 -and (Number (Control 102) 2355) -eq 1) 'Show symbols was not applied to the split pane.'
-    $fixtureCount=[IO.File]::ReadAllText((Join-Path $directory 'after.json')).Length
+    # Split moves the active tab (after.json) to the focused right pane; before.json stays left.
+    $leftCount=[IO.File]::ReadAllText((Join-Path $directory 'before.json')).Length
+    $rightCount=[IO.File]::ReadAllText((Join-Path $directory 'after.json')).Length
     Number (Control 101) 2160 0 3 | Out-Null
     Number (Control 102) 2160 0 4 | Out-Null
-    Check-CharacterCount $fixtureCount 3
-    [RstpdSmoke]::PostMessage((Control 101),0x100,[IntPtr]117,[IntPtr]::Zero) | Out-Null
-    Check-CharacterCount $fixtureCount 4
+    Check-CharacterCount $rightCount 4
     [RstpdSmoke]::PostMessage((Control 102),0x100,[IntPtr]117,[IntPtr]::Zero) | Out-Null
-    Check-CharacterCount $fixtureCount 3
+    Check-CharacterCount $leftCount 3
+    [RstpdSmoke]::PostMessage((Control 101),0x100,[IntPtr]117,[IntPtr]::Zero) | Out-Null
+    Check-CharacterCount $rightCount 4
     Number (Control 101) 2160 0 0 | Out-Null
     Command 1050
     Command 1040
@@ -840,6 +845,8 @@ try {
     Assert ((Number (Control 102) 2481 6) -ne (Number (Control 102) 2481 0)) 'Split view lost Markdown theme styling.'
     Command 1051
     Assert ((Number (Control 104) 2481 6) -ne (Number (Control 104) 2481 0)) 'Document map lost Markdown styling.'
+    # Split moved the Markdown tab to the right pane; collapse it so the left editor shows it again.
+    Command 1050
     Number (Control 101) 2025 (Number (Control 101) 2006) | Out-Null
     $ending = '**Live changes**'
     Type-Text "`r$ending"
