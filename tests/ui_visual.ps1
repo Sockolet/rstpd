@@ -110,7 +110,7 @@ try {
             $editor = [VisualUi]::GetDlgItem($window, $id)
             $r = [VisualUi+Rect]::new()
             [void][VisualUi]::GetWindowRect($editor, [ref]$r)
-            $tab = [VisualUi]::GetDlgItem($window, $(if ($id -eq 101) {302} else {304}))
+            $tab = [VisualUi]::GetDlgItem($window, $(if ($id -eq 101) {302} else {306}))
             if ([VisualUi]::SendMessage($tab,0x1304,[IntPtr]::Zero,[IntPtr]::Zero).ToInt64() -ne 1) { throw 'Each pane must own exactly one fixture tab' }
             $strip = $bitmap.GetPixel($r.left-$wr.left+100,$r.top-$wr.top-2)
             if ($strip.ToArgb() -ne [Drawing.Color]::FromArgb(35,38,44).ToArgb()) {

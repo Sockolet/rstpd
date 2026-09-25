@@ -302,7 +302,7 @@ try {
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
-    $rightTabs = [SelectionUi]::GetDlgItem($window, 304)
+    $rightTabs = [SelectionUi]::GetDlgItem($window, 306)
     [SelectionUi]::FocusEditor($window, $left)
     Post $window 0x111 1062
     Click $left
@@ -395,7 +395,7 @@ try {
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
-    $rightTabs = [SelectionUi]::GetDlgItem($window, 304)
+    $rightTabs = [SelectionUi]::GetDlgItem($window, 306)
     if ((Send $rightTabs 0x1304) -ne 1 -or (Send $right 2006) -ne 2) { throw 'Recovery failed to restore right group document' }
     [SelectionUi]::FocusEditor($window, $left)
     Keys '^{TAB}'
@@ -414,7 +414,7 @@ try {
     $app.Refresh()
     $window = $app.MainWindowHandle
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
-    $rightTabs = [SelectionUi]::GetDlgItem($window, 304)
+    $rightTabs = [SelectionUi]::GetDlgItem($window, 306)
     if ((Send $tabs 0x1304) + (Send $rightTabs 0x1304) -ne $damaged.documents.Count) {
         throw 'Damaged pane metadata lost or duplicated document tabs'
     }
@@ -438,7 +438,7 @@ try {
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
-    $rightTabs = [SelectionUi]::GetDlgItem($window, 304)
+    $rightTabs = [SelectionUi]::GetDlgItem($window, 306)
     if ((Send $tabs 0x1304) -ne $legacy.documents.Count + 1 -or (Send $rightTabs 0x1304) -ne 0) { throw 'Legacy recovery or file open lost tabs' }
     if ((Send $left 2006) -ne 14) { throw 'File open did not select its document' }
     Post $window 0x111 1504
@@ -456,7 +456,7 @@ try {
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
-    $rightTabs = [SelectionUi]::GetDlgItem($window, 304)
+    $rightTabs = [SelectionUi]::GetDlgItem($window, 306)
     $original = Send $left 2357
     Post $window 0x111 1504
     if ((Send $right 2357) -ne $original -or (Send $left 2357) -eq $original) { throw 'Moving last tab must not silently clone it' }

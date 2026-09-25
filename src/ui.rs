@@ -163,6 +163,8 @@ const TREE_ID: usize = 301;
 const TAB_ID: usize = 302;
 const RESULTS_EDITOR_ID: usize = 105;
 const RESULTS_DIVIDER_ID: usize = 304;
+const RIGHT_TAB_ID: usize = 306;
+const PAINT_MENU_RULE: u32 = WM_APP + 0x37;
 const TOOLBAR: [toolbar::Button; 8] = [
     toolbar::Button {
         command: NEW,
@@ -238,19 +240,32 @@ thread_local! {
     static SPLIT_BOUNDS: Cell<Option<RECT>> = const { Cell::new(None) };
     static SPLIT_DRAG_OFFSET: Cell<Option<i32>> = const { Cell::new(None) };
     static PANEL_BOUNDS: RefCell<Vec<RECT>> = const { RefCell::new(Vec::new()) };
-    static PANE_STRIPS: Cell<[Option<RECT>; 2]> = const { Cell::new([None, None]) };
     static ACTIVE_PANE: Cell<usize> = const { Cell::new(0) };
 }
 
+// The active pane's selected tab carries the accent stripe; repaint both bars when it moves.
 fn select_pane(hwnd: HWND, pane: usize) {
     let previous = ACTIVE_PANE.with(|active| active.replace(pane));
     if previous != pane {
-        for rect in PANE_STRIPS.with(Cell::get).into_iter().flatten() {
+        for id in [TAB_ID, RIGHT_TAB_ID] {
             unsafe {
-                InvalidateRect(hwnd, &rect, 1);
+                let tabs = GetDlgItem(hwnd, id as i32);
+                if !tabs.is_null() {
+                    InvalidateRect(tabs, null(), 1);
+                }
             }
         }
     }
+}
+
+fn document_position(documents: &[Document], id: u64) -> Option<usize> {
+    documents.iter().position(|doc| doc.snapshot.id == id)
+}
+
+fn pinned_first(documents: &[Document], group: &mut [u64]) {
+    group.sort_by_key(|id| {
+        !document_position(documents, *id).is_some_and(|index| documents[index].snapshot.pinned)
+    });
 }
 
 fn panel_edges(rect: RECT, split: Option<RECT>) -> Vec<RECT> {
@@ -630,7 +645,7 @@ unsafe fn paint_menu_rule(hwnd: HWND, supplied: HDC) {
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match message {
-            0x8037 => {
+            PAINT_MENU_RULE => {
                 paint_menu_rule(hwnd, null_mut());
                 return 0;
             }
@@ -755,8 +770,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                             _ => {}
                         }
                     }
-                    TAB_ID | 304 if header.code == TCN_SELCHANGE => {
-                        queue(Event::Tab(usize::from(header.idFrom == 304)))
+                    TAB_ID | RIGHT_TAB_ID if header.code == TCN_SELCHANGE => {
+                        queue(Event::Tab(usize::from(header.idFrom == RIGHT_TAB_ID)))
                     }
                     TREE_ID if header.code == TVN_SELCHANGEDW && !TREE_UPDATING.with(Cell::get) => {
                         let n = &*(l as *const NMTREEVIEWW);
@@ -837,7 +852,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             WM_DRAWITEM => {
                 let item = &*(l as *const DRAWITEMSTRUCT);
                 if item.CtlType == ODT_MENU {
-                    PostMessageW(hwnd, 0x8037, 0, 0);
+                    PostMessageW(hwnd, PAINT_MENU_RULE, 0, 0);
                 }
                 if item.CtlType == ODT_BUTTON
                     && let Some(button) = TOOLBAR
@@ -1193,7 +1208,7 @@ unsafe extern "system" fn tab_proc(
     _: usize,
 ) -> LRESULT {
     unsafe {
-        let pane = usize::from(GetDlgCtrlID(hwnd) == 304);
+        let pane = usize::from(GetDlgCtrlID(hwnd) == RIGHT_TAB_ID as i32);
         match message {
             WM_NCHITTEST => {
                 let mut point = POINT {
@@ -1233,10 +1248,10 @@ unsafe extern "system" fn tab_proc(
                     let active_tabs = GetDlgItem(
                         GetParent(hwnd),
                         if ACTIVE_PANE.with(Cell::get) == 0 {
-                            TAB_ID as i32
+                            TAB_ID
                         } else {
-                            304
-                        },
+                            RIGHT_TAB_ID
+                        } as i32,
                     );
                     let current = tab_document_id(
                         active_tabs,
@@ -1814,7 +1829,7 @@ impl App {
             "SysTabControl32",
             "",
             TCS_OWNERDRAWFIXED | TCS_FIXEDWIDTH | TCS_FOCUSNEVER,
-            304,
+            RIGHT_TAB_ID,
         )?;
         unsafe {
             SetWindowSubclass(self.tabs, Some(tab_proc), 2, 0);
@@ -2553,22 +2568,10 @@ impl App {
                 }
             }
             PANEL_BOUNDS.with(|bounds| bounds.borrow_mut().clear());
-            PANE_STRIPS.with(|strips| strips.set([None, None]));
-            let place_panel = |hwnd, x, y, width: i32, height: i32, pane: Option<usize>| {
+            let place_panel = |hwnd, x, y, width: i32, height: i32, top_gap: i32| {
                 let inset = i32::from(self.palette.dark && width > 2 && height > 2);
-                let top_inset = if let Some(pane) = pane {
-                    let strip_h = self.scale(3).max(1).min(height.max(1));
-                    PANE_STRIPS.with(|strips| {
-                        let mut bounds = strips.get();
-                        bounds[pane] = Some(RECT {
-                            left: x,
-                            top: y,
-                            right: x + width,
-                            bottom: y + strip_h,
-                        });
-                        strips.set(bounds);
-                    });
-                    strip_h
+                let top_inset = if top_gap > 0 {
+                    top_gap.min(height.max(1))
                 } else {
                     inset
                 };
@@ -2628,7 +2631,9 @@ impl App {
                 status_h,
                 1,
             );
-            place_panel(self.tree, 0, top, tree_w, body_h, None);
+            // Editors keep a small gap below their tab bars; side panels only use the border inset.
+            let editor_gap = self.scale(3).max(1);
+            place_panel(self.tree, 0, top, tree_w, body_h, 0);
             ShowWindow(self.tree, if self.tree_visible { SW_SHOW } else { SW_HIDE });
             let left_top = (self.compare_top[0] as i32
                 * self.editors[0].send(SCI_TEXTHEIGHT, 0, 0).max(1) as i32)
@@ -2640,7 +2645,7 @@ impl App {
                 top + left_top,
                 left_w,
                 body_h - left_top,
-                Some(0),
+                editor_gap,
             );
             ShowWindow(
                 self.editors[1].hwnd,
@@ -2661,10 +2666,10 @@ impl App {
                     top + right_top,
                     (content_w - left_w - gap).max(1),
                     body_h - right_top,
-                    Some(1),
+                    editor_gap,
                 );
             }
-            place_panel(self.map.hwnd, width - map_w, top, map_w, body_h, None);
+            place_panel(self.map.hwnd, width - map_w, top, map_w, body_h, 0);
             ShowWindow(
                 self.map.hwnd,
                 if self.map_visible { SW_SHOWNA } else { SW_HIDE },
@@ -3000,15 +3005,7 @@ impl App {
         }
         if !self.groups[other].contains(&id) {
             self.groups[other].push(id);
-            self.groups[other].sort_by_key(|id| {
-                !self
-                    .documents
-                    .iter()
-                    .find(|doc| doc.snapshot.id == *id)
-                    .unwrap()
-                    .snapshot
-                    .pinned
-            });
+            pinned_first(&self.documents, &mut self.groups[other]);
         }
         if !clone {
             self.groups[source].retain(|entry| *entry != id);
@@ -3017,7 +3014,7 @@ impl App {
                     .documents
                     .iter()
                     .position(|doc| self.groups[source].contains(&doc.snapshot.id))
-                    .unwrap();
+                    .ok_or("The source pane has no remaining tab.")?;
                 if source == 0 {
                     self.primary = replacement;
                 } else {
@@ -3113,13 +3110,11 @@ impl App {
                     self.secondary
                 };
                 let mut selected = 0;
-                for (i, id) in self.groups[pane].iter().enumerate() {
-                    let (index, doc) = self
-                        .documents
-                        .iter()
-                        .enumerate()
-                        .find(|(_, doc)| doc.snapshot.id == *id)
-                        .unwrap();
+                let entries = self.groups[pane].iter().filter_map(|id| {
+                    document_position(&self.documents, *id)
+                        .map(|index| (index, &self.documents[index]))
+                });
+                for (i, (index, doc)) in entries.enumerate() {
                     if Some(index) == visible {
                         selected = i;
                     }
@@ -3169,12 +3164,8 @@ impl App {
             let pins: Vec<_> = group
                 .iter()
                 .map(|id| {
-                    self.documents
-                        .iter()
-                        .find(|doc| doc.snapshot.id == *id)
-                        .unwrap()
-                        .snapshot
-                        .pinned
+                    document_position(&self.documents, *id)
+                        .is_some_and(|index| self.documents[index].snapshot.pinned)
                 })
                 .collect();
             let target = tabs::move_target(&pins, local, requested)?;
@@ -3183,15 +3174,7 @@ impl App {
         } else {
             self.documents[from].snapshot.pinned = !self.documents[from].snapshot.pinned;
             for group in &mut self.groups {
-                group.sort_by_key(|id| {
-                    !self
-                        .documents
-                        .iter()
-                        .find(|doc| doc.snapshot.id == *id)
-                        .unwrap()
-                        .snapshot
-                        .pinned
-                });
+                pinned_first(&self.documents, group);
             }
         }
         self.primary = self
@@ -3653,7 +3636,7 @@ impl App {
             pane_documents: self.groups.clone().map(|group| {
                 group
                     .iter()
-                    .filter_map(|id| self.documents.iter().position(|doc| doc.snapshot.id == *id))
+                    .filter_map(|id| document_position(&self.documents, *id))
                     .collect()
             }),
             pane_selected: [self.primary, self.secondary.unwrap_or(0)],
@@ -3663,18 +3646,9 @@ impl App {
     fn normalize_groups(&mut self) {
         for group in &mut self.groups {
             let mut seen = HashSet::new();
-            group.retain(|id| {
-                seen.insert(*id) && self.documents.iter().any(|doc| doc.snapshot.id == *id)
-            });
-            group.sort_by_key(|id| {
-                !self
-                    .documents
-                    .iter()
-                    .find(|doc| doc.snapshot.id == *id)
-                    .unwrap()
-                    .snapshot
-                    .pinned
-            });
+            group
+                .retain(|id| seen.insert(*id) && document_position(&self.documents, *id).is_some());
+            pinned_first(&self.documents, group);
         }
         if self.groups[0].is_empty() {
             self.groups.swap(0, 1);
@@ -4256,13 +4230,9 @@ impl App {
             let current = group
                 .iter()
                 .position(|id| *id == self.documents[left].snapshot.id)
-                .unwrap();
-            let id = group[(current + 1) % group.len()];
-            let right = self
-                .documents
-                .iter()
-                .position(|doc| doc.snapshot.id == id)
-                .unwrap();
+                .ok_or("The current document is outside the focused pane.")?;
+            let right = document_position(&self.documents, group[(current + 1) % group.len()])
+                .ok_or("The next tab is no longer open.")?;
             self.begin_compare(left, right)
         }
     }
@@ -5043,7 +5013,10 @@ impl App {
             TAB_LEFT | TAB_RIGHT => {
                 let id = self.documents[self.index()].snapshot.id;
                 let group = &self.groups[self.focused];
-                let position = group.iter().position(|entry| *entry == id).unwrap();
+                let position = group
+                    .iter()
+                    .position(|entry| *entry == id)
+                    .ok_or("The current tab is outside the focused pane.")?;
                 let target = if command == TAB_LEFT {
                     position.saturating_sub(1)
                 } else {
@@ -5282,13 +5255,11 @@ impl App {
         if control && key == VK_TAB {
             let indices: Vec<_> = self.groups[self.focused]
                 .iter()
-                .map(|id| {
-                    self.documents
-                        .iter()
-                        .position(|doc| doc.snapshot.id == *id)
-                        .unwrap()
-                })
+                .filter_map(|id| document_position(&self.documents, *id))
                 .collect();
+            if indices.is_empty() {
+                return Ok(true);
+            }
             let current = indices.iter().position(|i| *i == self.index()).unwrap_or(0);
             let next = (current + if shift { indices.len() - 1 } else { 1 }) % indices.len();
             self.switch(indices[next])?;
@@ -6102,22 +6073,6 @@ mod split_tests {
                     bottom: 95,
                 });
             });
-            PANE_STRIPS.with(|strips| {
-                strips.set([
-                    Some(RECT {
-                        left: 5,
-                        top: 5,
-                        right: 40,
-                        bottom: 8,
-                    }),
-                    Some(RECT {
-                        left: 50,
-                        top: 5,
-                        right: 95,
-                        bottom: 8,
-                    }),
-                ]);
-            });
             SPLIT_BOUNDS.with(|bounds| {
                 bounds.set(Some(RECT {
                     left: 40,
@@ -6154,7 +6109,6 @@ mod split_tests {
             PANEL_BRUSH.with(|panel| panel.set(old_brush));
             PANEL_BOUNDS.with(|bounds| bounds.borrow_mut().clear());
             SPLIT_BOUNDS.with(|bounds| bounds.set(None));
-            PANE_STRIPS.with(|strips| strips.set([None, None]));
             ACTIVE_PANE.with(|active| active.set(0));
             SelectObject(dc, old_bitmap);
             DeleteObject(bitmap);
