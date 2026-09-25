@@ -268,6 +268,11 @@ fn pinned_first(documents: &[Document], group: &mut [u64]) {
     });
 }
 
+/// Document shown by `pane`, or `None` when pane 1 is hidden (split view closed).
+fn visible_pane_document(pane: usize, primary: usize, secondary: Option<usize>) -> Option<usize> {
+    if pane == 0 { Some(primary) } else { secondary }
+}
+
 fn panel_edges(rect: RECT, split: Option<RECT>) -> Vec<RECT> {
     let mut edges = vec![
         RECT {
@@ -1811,8 +1816,24 @@ impl App {
     fn scale(&self, value: i32) -> i32 {
         value * self.dpi as i32 / 96
     }
+    fn apply_tab_item_size(&self) {
+        let size = ((self.scale(34) as isize) << 16) | self.scale(190) as isize;
+        for tabs in [self.tabs, self.right_tabs] {
+            unsafe {
+                SendMessageW(tabs, TCM_SETITEMSIZE, 0, size);
+            }
+        }
+    }
     fn touch(&mut self) {
         self.revision += 1;
+    }
+    fn set_document_language(&mut self, index: usize, language: usize) {
+        let name = self.languages[language].name.clone();
+        let doc = &mut self.documents[index];
+        doc.language = language;
+        doc.snapshot.language = name;
+        doc.revision += 1;
+        doc.styled_revision = None;
     }
     fn note(&mut self, text: impl Into<String>) {
         self.note = text.into();
@@ -1832,23 +1853,13 @@ impl App {
             RIGHT_TAB_ID,
         )?;
         unsafe {
-            SetWindowSubclass(self.tabs, Some(tab_proc), 2, 0);
-            SetWindowSubclass(self.right_tabs, Some(tab_proc), 2, 0);
-            SendMessageW(
-                self.right_tabs,
-                TCM_SETITEMSIZE,
-                0,
-                ((self.scale(34) as isize) << 16) | self.scale(190) as isize,
-            );
+            if SetWindowSubclass(self.tabs, Some(tab_proc), 2, 0) == 0
+                || SetWindowSubclass(self.right_tabs, Some(tab_proc), 2, 0) == 0
+            {
+                return Err("Could not install tab-control behavior.".into());
+            }
         }
-        unsafe {
-            SendMessageW(
-                self.tabs,
-                TCM_SETITEMSIZE,
-                0,
-                ((self.scale(34) as isize) << 16) | self.scale(190) as isize,
-            );
-        }
+        self.apply_tab_item_size();
         self.status = self.control("STATIC", "", WS_VISIBLE | SS_CENTERIMAGE, 303)?;
         self.tree = self.control(
             "SysTreeView32",
@@ -3377,6 +3388,19 @@ impl App {
             encoding
         };
         let (text, encoding) = core::decode(&bytes, fallback)?;
+        let utf16_note = if fallback.is_none()
+            && matches!(encoding, Encoding::Utf8 | Encoding::Legacy(_))
+        {
+            core::bomless_utf16_hint(&bytes).map(|hint| {
+                format!(
+                    "No Unicode BOM: opened as {}, but the bytes look like {}; Encoding > Reopen can change this.",
+                    encoding.label(),
+                    hint.label()
+                )
+            })
+        } else {
+            None
+        };
         let eol = Eol::detect(&text);
         let language = languages::detect(&path, &self.languages);
         let title = path
@@ -3398,7 +3422,9 @@ impl App {
             caret: 0,
             pinned: false,
         })?;
-        if fallback {
+        if let Some(note) = utf16_note {
+            self.note(note);
+        } else if fallback {
             self.note("No Unicode BOM / valid UTF-8: opened as Windows-1252; Encoding > Reopen can change this.");
         }
         Ok(())
@@ -3511,8 +3537,10 @@ impl App {
         doc.base_dirty = false;
         doc.metadata_dirty = false;
         if was_unnamed || save_as {
-            doc.language = languages::detect(&path, &self.languages);
-            doc.snapshot.language = self.languages[doc.language].name.clone();
+            let detected = languages::detect(&path, &self.languages);
+            if detected != self.documents[index].language {
+                self.set_document_language(index, detected);
+            }
         }
         self.editor().send(SCI_SETSAVEPOINT, 0, 0);
         self.touch();
@@ -4681,17 +4709,16 @@ impl App {
             changed.push(languages::add_custom(&mut languages, definition)?);
         }
         self.languages = languages;
-        for doc in &mut self.documents {
-            if doc.language == 0
-                && let Some(path) = &doc.snapshot.path
+        for index in 0..self.documents.len() {
+            let current = self.documents[index].language;
+            let mut language = current;
+            if language == 0
+                && let Some(path) = &self.documents[index].snapshot.path
             {
-                doc.language = languages::detect(path, &self.languages);
-                doc.snapshot.language = self.languages[doc.language].name.clone();
+                language = languages::detect(path, &self.languages);
             }
-            if changed.contains(&doc.language) {
-                doc.snapshot.language = self.languages[doc.language].name.clone();
-                doc.revision += 1;
-                doc.styled_revision = None;
+            if language != current || changed.contains(&language) {
+                self.set_document_language(index, language);
             }
         }
         self.make_menu()?;
@@ -4732,14 +4759,12 @@ impl App {
         let removed = self.languages.remove(language);
         self.completion_api
             .retain(|api| api.language != removed.name);
-        for doc in &mut self.documents {
-            if doc.language == language {
-                doc.language = 0;
-                doc.snapshot.language = self.languages[0].name.clone();
-                doc.revision += 1;
-                doc.styled_revision = None;
-            } else if doc.language > language {
-                doc.language -= 1;
+        for index in 0..self.documents.len() {
+            let current = self.documents[index].language;
+            if current == language {
+                self.set_document_language(index, 0);
+            } else if current > language {
+                self.documents[index].language -= 1;
             }
         }
         self.make_menu()?;
@@ -5447,6 +5472,7 @@ impl App {
             Event::Dpi => {
                 self.dpi = unsafe { GetDpiForWindow(self.hwnd) };
                 self.set_font();
+                self.apply_tab_item_size();
                 self.layout();
             }
             Event::TabFocus(pane) => {
@@ -5555,6 +5581,9 @@ impl App {
                 }
             }
             Event::Changed(pane) => {
+                let Some(index) = visible_pane_document(pane, self.primary, self.secondary) else {
+                    return Ok(());
+                };
                 self.last_zero_match = None;
                 if self.editors[pane].length() > core::MAX_DOCUMENT_BYTES {
                     self.editors[pane].send(SCI_UNDO, 0, 0);
@@ -5563,11 +5592,6 @@ impl App {
                             .into(),
                     );
                 }
-                let index = if pane == 0 {
-                    self.primary
-                } else {
-                    self.secondary.unwrap_or(self.primary)
-                };
                 let doc = &mut self.documents[index];
                 let dirty = doc.base_dirty
                     || doc.metadata_dirty
@@ -5613,10 +5637,8 @@ impl App {
                 self.update_status();
             }
             Event::Style(pane) => {
-                let index = if pane == 0 {
-                    self.primary
-                } else {
-                    self.secondary.unwrap_or(self.primary)
+                let Some(index) = visible_pane_document(pane, self.primary, self.secondary) else {
+                    return Ok(());
                 };
                 if self.languages[self.documents[index].language].uses_container()
                     && self.editors[pane].send(SCI_GETENDSTYLED, 0, 0)
@@ -5791,7 +5813,7 @@ pub fn run() -> Result<()> {
                 )
             })?;
         let recovery_path = directory.join("session.json");
-        let session = session::load(&recovery_path)?;
+        let (session, recovery_warning) = session::load_or_quarantine(&recovery_path)?;
         let class = wide("rstpd.Window");
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -5990,6 +6012,9 @@ pub fn run() -> Result<()> {
         app.layout();
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        if let Some(warning) = &recovery_warning {
+            ask(hwnd, warning, MB_OK | MB_ICONWARNING);
+        }
         if SetTimer(hwnd, 1, 250, None) == 0 {
             return Err("Could not start the recovery timer.".into());
         }
@@ -6029,6 +6054,18 @@ pub fn run() -> Result<()> {
         PANEL_BRUSH.with(|b| DeleteObject(b.replace(null_mut())));
         FIELD_BRUSH.with(|b| DeleteObject(b.replace(null_mut())));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pane_event_tests {
+    use super::visible_pane_document;
+
+    #[test]
+    fn hidden_pane_events_have_no_document() {
+        assert_eq!(visible_pane_document(0, 3, None), Some(3));
+        assert_eq!(visible_pane_document(1, 3, None), None);
+        assert_eq!(visible_pane_document(1, 3, Some(5)), Some(5));
     }
 }
 

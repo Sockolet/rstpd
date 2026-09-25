@@ -342,9 +342,11 @@ fn receiver_type(text: &str, analysis: &Analysis, receiver: &str, caret: usize) 
         return None;
     }
     let variable = regex::escape(receiver);
-    let assignment = Regex::new(&format!(r"(?m)\b{variable}[ \t]*(?::[^=\n]+)?="))
-        .expect("escaped bounded identifier");
-    let annotation = Regex::new(&format!(
+    let assignment = Regex::new(&format!(
+        r"(?m)\b{variable}[ \t]*(?::[^=\n]+)?=(?:[^=>\n]|$)"
+    ))
+    .expect("escaped bounded identifier");
+    let annotation_pattern = Regex::new(&format!(
         r"\b{variable}[ \t]*:[ \t]*&?(?:mut[ \t]+)?([\w]+)|\b([\w]+)(?:<[^>]+>)?[ \t]+{variable}\b"
     ))
     .expect("escaped identifier forms a valid annotation expression");
@@ -355,20 +357,26 @@ fn receiver_type(text: &str, analysis: &Analysis, receiver: &str, caret: usize) 
         other => other.to_owned(),
     };
     let binding = assignment.find_iter(&analysis.masked[..caret]).last();
-    if let Some(caps) = annotation.captures_iter(&analysis.masked[..caret]).last()
+    let annotation = annotation_pattern
+        .captures_iter(&analysis.masked[..caret])
+        .filter(|caps| {
+            let kind = caps.get(1).or(caps.get(2)).unwrap().as_str();
+            !matches!(kind, "let" | "const" | "var" | "mut" | "return" | "if")
+        })
+        .last();
+    if let Some(caps) = annotation
         && binding
             .as_ref()
             .is_none_or(|binding| caps.get(0).unwrap().end() >= binding.start())
     {
         let kind = caps.get(1).or(caps.get(2)).unwrap().as_str();
-        if !matches!(kind, "let" | "const" | "var" | "mut" | "return") {
-            return Some(normalize(kind));
-        }
+        return Some(normalize(kind));
     }
     if let Some(binding) = binding {
-        let rhs = text[binding.end()..caret]
-            .trim_start()
-            .trim_start_matches("new ");
+        let equals = analysis.masked[..binding.end()]
+            .rfind('=')
+            .map_or(binding.end(), |offset| offset + 1);
+        let rhs = text[equals..caret].trim_start().trim_start_matches("new ");
         if rhs.starts_with(['"', '\'', '`']) {
             return Some("string".into());
         }
@@ -539,13 +547,19 @@ pub fn call_tip(text: &str, caret: usize, language: &str, extra: &[Api]) -> Opti
         })?;
     let mut argument = 0;
     let mut depth = 0;
+    let mut generics = 0usize;
+    let mut previous = ['\0'; 2];
     for ch in prefix_mask[open + 1..].chars() {
         match ch {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
-            ',' if depth == 0 => argument += 1,
+            // Only turbofish `::<` opens generics; a bare `<` is usually a comparison.
+            '<' if previous == [':', ':'] => generics += 1,
+            '>' if generics > 0 => generics -= 1,
+            ',' if depth == 0 && generics == 0 => argument += 1,
             _ => {}
         }
+        previous = [previous[1], ch];
     }
     let signature_mask = code_mask(&api.signature, language);
     let begin = api.signature.find('(')? + 1;
@@ -752,5 +766,22 @@ mod tests {
             assert!(rust.contains(&"trim".into()), "{rust:?}");
             assert!(!rust.contains(&"strip".into()), "{rust:?}");
         }
+    }
+
+    #[test]
+    fn turbofish_commas_and_comparisons_do_not_shift_call_tip_arguments() {
+        let text = "fn f(a: i32, b: i32, c: i32) {}\nf(g::<A, B>(), ";
+        let tip = call_tip(text, text.len(), "Rust", &[]).unwrap();
+        assert_eq!(tip.signature[tip.parameter].trim(), "b: i32");
+        let text = "fn f(a: i32, b: i32, c: i32) {}\nf(x < y, ";
+        let tip = call_tip(text, text.len(), "Rust", &[]).unwrap();
+        assert_eq!(tip.signature[tip.parameter].trim(), "b: i32");
+    }
+
+    #[test]
+    fn comparisons_do_not_replace_annotated_receiver_types() {
+        let text = "let text: String = String::new();\nif text == \"\" {}\ntext.tr";
+        let words = suggestions(text, text.len(), "Rust", &[], &[], false).words;
+        assert!(words.contains(&"trim".into()), "{words:?}");
     }
 }

@@ -1,3 +1,4 @@
+param([switch]$Force)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $packages = @(
@@ -13,7 +14,7 @@ foreach ($package in $packages) {
     $destination = Join-Path $root "vendor\$($package.Name)"
     $stamp = Join-Path $destination '.rstpd-source-hash'
     if ((Test-Path $destination) -and
-        (!(Test-Path $stamp) -or (Get-Content $stamp -Raw).Trim() -ne $package.Hash)) {
+        ($Force -or !(Test-Path $stamp) -or (Get-Content $stamp -Raw).Trim() -ne $package.Hash)) {
         Remove-Item -Recurse -Force $destination
     }
     if (!(Test-Path $destination)) {
@@ -21,18 +22,28 @@ foreach ($package in $packages) {
         Set-Content -LiteralPath $stamp -Value $package.Hash -Encoding ascii
     }
 }
+$dataHash = '84D7DBE9D9CEB34961AD6FBDCF91A24F7CC1A2FD59D1851C0F5F4A0CDBFDE2F9'
 $dataArchive = Join-Path $root 'vendor\scite566.zip'
-if ((Get-FileHash $dataArchive -Algorithm SHA256).Hash -ne '84D7DBE9D9CEB34961AD6FBDCF91A24F7CC1A2FD59D1851C0F5F4A0CDBFDE2F9') {
+if (!(Test-Path $dataArchive)) { throw "Missing vendored source archive: $dataArchive" }
+if ((Get-FileHash $dataArchive -Algorithm SHA256).Hash -ne $dataHash) {
     throw 'Language data integrity check failed.'
 }
 $data = Join-Path $root 'vendor\language-data'
-New-Item -ItemType Directory -Force $data | Out-Null
-$zip = [IO.Compression.ZipFile]::OpenRead($dataArchive)
-try {
-    foreach ($entry in $zip.Entries) {
-        if ($entry.FullName -match '^scite/(src/[^/]+\.properties|License\.txt)$') {
-            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $data $entry.Name), $true)
+$dataStamp = Join-Path $data '.rstpd-source-hash'
+if ((Test-Path $data) -and
+    ($Force -or !(Test-Path $dataStamp) -or (Get-Content $dataStamp -Raw).Trim() -ne $dataHash)) {
+    Remove-Item -Recurse -Force $data
+}
+if (!(Test-Path $data)) {
+    New-Item -ItemType Directory -Force $data | Out-Null
+    $zip = [IO.Compression.ZipFile]::OpenRead($dataArchive)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ($entry.FullName -match '^scite/(src/[^/]+\.properties|License\.txt)$') {
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $data $entry.Name), $true)
+            }
         }
-    }
-} finally { $zip.Dispose() }
+    } finally { $zip.Dispose() }
+    Set-Content -LiteralPath $dataStamp -Value $dataHash -Encoding ascii
+}
 Write-Host 'Pinned Scintilla and Lexilla sources are ready. Run cargo build --release.'

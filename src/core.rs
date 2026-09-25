@@ -258,6 +258,34 @@ pub fn decode(bytes: &[u8], override_encoding: Option<&Encoding>) -> Result<(Str
     Ok((text, encoding))
 }
 
+/// Returns the UTF-16 byte order that BOM-less `bytes` most likely use.
+/// Only a hint for the UI: auto-detection still prefers UTF-8, so valid UTF-8
+/// is never silently reinterpreted.
+pub fn bomless_utf16_hint(bytes: &[u8]) -> Option<Encoding> {
+    const SAMPLE_BYTES: usize = 64 * 1024;
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let sample = &bytes[..bytes.len().min(SAMPLE_BYTES)];
+    let pairs = sample.len() / 2;
+    if pairs < 2 {
+        return None;
+    }
+    let (mut even, mut odd) = (0usize, 0usize);
+    for pair in sample.as_chunks::<2>().0 {
+        even += usize::from(pair[0] == 0);
+        odd += usize::from(pair[1] == 0);
+    }
+    let encoding = if odd * 10 >= pairs * 7 && even * 10 <= pairs {
+        Encoding::Utf16Le
+    } else if even * 10 >= pairs * 7 && odd * 10 <= pairs {
+        Encoding::Utf16Be
+    } else {
+        return None;
+    };
+    decode(bytes, Some(&encoding)).is_ok().then_some(encoding)
+}
+
 pub fn encoding_options() -> Vec<Encoding> {
     let mut encodings = vec![
         Encoding::Utf8,
@@ -1274,6 +1302,19 @@ mod tests {
                 (text.into(), encoding)
             );
         }
+    }
+    #[test]
+    fn bomless_utf16_is_only_hinted_when_nul_bytes_are_one_sided() {
+        assert_eq!(bomless_utf16_hint(b"a\0b\0c\0"), Some(Encoding::Utf16Le));
+        assert_eq!(bomless_utf16_hint(b"\0a\0b\0c"), Some(Encoding::Utf16Be));
+        assert_eq!(bomless_utf16_hint(b"plain text"), None);
+        assert_eq!(bomless_utf16_hint(b"\0\0\0\0"), None);
+        assert_eq!(bomless_utf16_hint(b"a\0b"), None);
+        assert_eq!(bomless_utf16_hint(b"a\0"), None);
+        let mut unpaired = b"a\0".repeat(9);
+        unpaired.extend_from_slice(b"\0\xd8");
+        assert_eq!(bomless_utf16_hint(&unpaired), None);
+        assert_eq!(decode(b"a\0b\0", None).unwrap().1, Encoding::Utf8);
     }
     #[test]
     fn malformed_and_lossy_encoding_is_rejected() {

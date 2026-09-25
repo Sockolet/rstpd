@@ -22,6 +22,7 @@ try {
     $version = ($metadata.packages | Where-Object { $_.name -eq 'rstpd' }).version
     $packageName = "rstpd-$version"
     $package = Join-Path $root "dist\$packageName"
+    if (Test-Path -LiteralPath $package) { Remove-Item -LiteralPath $package -Recurse -Force }
     New-Item -ItemType Directory -Force $package | Out-Null
     Copy-Item 'target\release\rstpd.exe' $package
     Copy-Item 'README.md','LICENSE','THIRD_PARTY_NOTICES.txt' $package

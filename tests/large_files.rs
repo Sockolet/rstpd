@@ -50,7 +50,7 @@ fn document_search_and_folder_boundaries_preserve_exact_results() {
     drop(text);
     drop(bytes);
 
-    let root = std::env::temp_dir().join(format!(
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "rstpd-large-search-{}-{}",
         std::process::id(),
         SystemTime::now()

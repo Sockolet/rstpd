@@ -17,13 +17,13 @@ Download the portable Windows ZIP from the
 [GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\rstpd-1.4.0\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-1.4.0\rstpd.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-1.4.1\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-1.4.1\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\rstpd-1.4.0\rstpd.exe
-.\dist\rstpd-1.4.0\rstpd.exe .\example.rs .\example.json
+.\dist\rstpd-1.4.1\rstpd.exe
+.\dist\rstpd-1.4.1\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
@@ -314,8 +314,8 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\rstpd-1.4.0\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-1.4.0\rstpd.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-1.4.1\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-1.4.1\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -370,14 +370,21 @@ removes that tab's recovery copy**. Autosave never writes the original files.
 Explicit Save uses a flushed temporary file and Windows atomic replacement.
 An external-change check warns before overwriting a file that changed on disk.
 It is a check, not an exclusive lock against other editors.
+File monitoring polls about once per second. An external edit that keeps both
+the file size and modification time is detected within about five seconds.
 
-Invalid recovery files are left untouched and reported at startup. To recover
-manually, keep a copy of the file, then move it out of the session directory.
+Invalid recovery files are never edited or deleted. At startup, rstpd renames
+an invalid `session.json` to `session.invalid-<timestamp>.json` in the same
+folder, reports the new name, and starts with an empty session. If the recovery
+file cannot be read or renamed, startup stops and reports the error instead.
 On reopen, named tabs use their recovery snapshots; a changed disk version is
 not silently substituted for the recovered text.
 
 Without a Unicode BOM, valid UTF-8 is preferred; otherwise the editor opens as
 Windows-1252 and reports the assumption (`.nfo` files use OEM 437 instead).
+If BOM-less bytes look like UTF-16, the status bar says so; the file is still
+opened as UTF-8 or Windows-1252 until you choose Encoding > Reopen. Saving as
+UTF-16 writes a BOM.
 Use **Encoding > Reopen** to explicitly
 reinterpret bytes. Reopen discards current edits only after confirmation.
 Conversions that cannot represent every character are rejected.
@@ -416,10 +423,12 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-1.4.0-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-1.4.1-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.
+Run `.\scripts\bootstrap.ps1 -Force` to recreate the extracted Scintilla,
+Lexilla and language-data folders from the pinned archives.
 
 For development, once Rust is on PATH:
 

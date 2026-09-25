@@ -5,6 +5,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const SESSION_VERSION: u32 = 2;
@@ -164,17 +165,24 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     result.map_err(|e| format!("Could not save {}: {e}", path.display()))
 }
 
+fn empty_session() -> Session {
+    Session {
+        version: SESSION_VERSION,
+        theme: "system".into(),
+        monitor_files: true,
+        ..Session::default()
+    }
+}
+
 pub fn load(path: &Path) -> Result<Session> {
     if !path.exists() {
-        return Ok(Session {
-            version: SESSION_VERSION,
-            theme: "system".into(),
-            monitor_files: true,
-            ..Session::default()
-        });
+        return Ok(empty_session());
     }
-    let bytes = read_bounded(path, MAX_RECOVERY_BYTES)?;
-    let session: Session = serde_json::from_slice(&bytes)
+    parse(&read_bounded(path, MAX_RECOVERY_BYTES)?)
+}
+
+fn parse(bytes: &[u8]) -> Result<Session> {
+    let session: Session = serde_json::from_slice(bytes)
         .map_err(|e| format!("Recovery file is invalid; it has not been changed: {e}"))?;
     if !matches!(session.version, 1 | SESSION_VERSION) {
         return Err("Unsupported recovery version; the file has not been changed.".into());
@@ -206,6 +214,62 @@ pub fn load(path: &Path) -> Result<Session> {
         }
     }
     Ok(session)
+}
+
+/// Loads recovery state for startup. Content that fails validation is renamed
+/// (never edited or deleted) so the editor can start with an empty session.
+/// Read errors such as access denied still fail startup, because renaming a
+/// file we could not read would hide an environmental problem.
+pub fn load_or_quarantine(path: &Path) -> Result<(Session, Option<String>)> {
+    if !path.exists() {
+        return Ok((empty_session(), None));
+    }
+    let bytes = read_bounded(path, MAX_RECOVERY_BYTES)?;
+    match parse(&bytes) {
+        Ok(session) => Ok((session, None)),
+        Err(error) => {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let moved =
+                quarantine(path, stamp).map_err(|move_error| format!("{error}\n\n{move_error}"))?;
+            Ok((
+                empty_session(),
+                Some(format!(
+                    "The recovery file could not be used and was moved, unchanged, to:\n{}\n\nrstpd started with an empty session.\n\nDetails: {error}",
+                    moved.display()
+                )),
+            ))
+        }
+    }
+}
+
+fn quarantine(path: &Path, stamp: u64) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or("The recovery file has no parent directory.")?;
+    let stem = path.file_stem().map_or_else(
+        || "session".into(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    for attempt in 0..100u32 {
+        let name = if attempt == 0 {
+            format!("{stem}.invalid-{stamp}.json")
+        } else {
+            format!("{stem}.invalid-{stamp}-{attempt}.json")
+        };
+        let target = parent.join(name);
+        if target
+            .try_exists()
+            .map_err(|e| format!("Could not inspect {}: {e}", target.display()))?
+        {
+            continue;
+        }
+        fs::rename(path, &target)
+            .map_err(|e| format!("The invalid recovery file could not be moved aside: {e}"))?;
+        return Ok(target);
+    }
+    Err("Could not choose a name for the invalid recovery file.".into())
 }
 
 pub fn save(path: &Path, session: &Session) -> Result<()> {
@@ -297,6 +361,117 @@ mod tests {
         assert_eq!(legacy.focused_pane, 0);
     }
     use super::*;
+
+    fn test_directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rstpd-{name}-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn invalid_recovery_is_moved_aside_unchanged() {
+        for input in [
+            b"{not json".to_vec(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 99,
+                "documents": [],
+                "active": 0,
+                "theme": "system"
+            }))
+            .unwrap(),
+        ] {
+            let dir = test_directory("invalid-recovery");
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join("session.json");
+            fs::write(&path, &input).unwrap();
+            let (session, warning) = load_or_quarantine(&path).unwrap();
+            assert!(session.documents.is_empty());
+            assert_eq!(session.version, SESSION_VERSION);
+            assert_eq!(session.theme, "system");
+            assert!(session.monitor_files);
+            let warning = warning.unwrap();
+            assert!(warning.contains("started with an empty session"));
+            assert!(!path.exists());
+            let entries: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            assert_eq!(entries.len(), 1);
+            let moved = entries[0].path();
+            let name = moved.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("session.invalid-"));
+            assert!(name.ends_with(".json"));
+            assert_eq!(fs::read(&moved).unwrap(), input);
+            assert!(warning.contains(&moved.display().to_string()));
+            fs::remove_file(moved).unwrap();
+            fs::remove_dir(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn valid_and_missing_recovery_are_not_moved() {
+        let dir = test_directory("valid-recovery");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.json");
+        let (missing, warning) = load_or_quarantine(&path).unwrap();
+        assert_eq!(missing.version, SESSION_VERSION);
+        assert!(warning.is_none());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        let session = Session {
+            version: SESSION_VERSION,
+            theme: "dark".into(),
+            ..Session::default()
+        };
+        save(&path, &session).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let (restored, warning) = load_or_quarantine(&path).unwrap();
+        assert_eq!(restored.theme, "dark");
+        assert!(warning.is_none());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn quarantine_never_overwrites_an_earlier_copy() {
+        let dir = test_directory("quarantine-collision");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.json");
+        let earlier = dir.join("session.invalid-42.json");
+        fs::write(&path, b"new").unwrap();
+        fs::write(&earlier, b"old").unwrap();
+        let moved = quarantine(&path, 42).unwrap();
+        assert_eq!(moved, dir.join("session.invalid-42-1.json"));
+        assert_eq!(fs::read(&earlier).unwrap(), b"old");
+        assert_eq!(fs::read(&moved).unwrap(), b"new");
+        fs::remove_file(earlier).unwrap();
+        fs::remove_file(moved).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_recovery_fails_without_moving() {
+        let dir = test_directory("unreadable-recovery");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.json");
+        fs::create_dir(&path).unwrap();
+        assert!(load_or_quarantine(&path).is_err());
+        assert!(path.is_dir());
+        assert!(!fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("session.invalid-")
+        }));
+        fs::remove_dir(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
 
     #[test]
     fn editor_font_preferences_round_trip_without_a_schema_bump() {

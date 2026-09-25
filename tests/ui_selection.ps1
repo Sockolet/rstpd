@@ -130,6 +130,30 @@ function Post([IntPtr]$Handle, [uint32]$Message, [long]$W = 0, [long]$L = 0) {
 function Send([IntPtr]$Handle, [uint32]$Message, [long]$W = 0, [long]$L = 0) {
     [SelectionUi]::SendMessage($Handle, $Message, [IntPtr]$W, [IntPtr]$L).ToInt64()
 }
+function Wait-Until([scriptblock]$Condition, [string]$Failure, [int]$TimeoutSeconds = 15) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (& $Condition) { return }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw $Failure
+}
+function Wait-AppWindow([Diagnostics.Process]$Process) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        if ($Process.HasExited) { throw 'Isolated test app exited' }
+        $Process.Refresh()
+        if ($Process.MainWindowHandle -ne 0) { return $Process.MainWindowHandle }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Isolated test window did not appear'
+}
+function Read-Session([string]$SessionDirectory) {
+    try {
+        Get-Content -LiteralPath (Join-Path $SessionDirectory 'session.json') -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch { $null }
+}
 function Click([IntPtr]$Handle, [int]$X = 90, [int]$Y = 40) {
     Post $Handle 0x201 1 (($Y -shl 16) -bor $X)
     Post $Handle 0x202 0 (($Y -shl 16) -bor $X)
@@ -290,15 +314,7 @@ $start.ArgumentList.Add('--session-dir')
 $start.ArgumentList.Add([IO.Path]::GetFullPath($directory))
 $app = [Diagnostics.Process]::Start($start)
 try {
-    $deadline = [DateTime]::UtcNow.AddSeconds(15)
-    do {
-        if ($app.HasExited) { throw 'Isolated test app exited' }
-        $app.Refresh()
-        if ($app.MainWindowHandle -ne 0) { break }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $deadline)
-    $window = $app.MainWindowHandle
-    if ($window -eq 0) { throw 'Isolated test window did not appear' }
+    $window = Wait-AppWindow $app
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
@@ -389,9 +405,7 @@ try {
     $saved = Get-Content (Join-Path $directory 'session.json') -Raw | ConvertFrom-Json
     if ($saved.pane_documents[1].Count -ne 1 -or $saved.documents.Count -lt 2) { throw 'Recovery lost group membership' }
     $app = [Diagnostics.Process]::Start($start)
-    Start-Sleep -Seconds 2
-    $app.Refresh()
-    $window = $app.MainWindowHandle
+    $window = Wait-AppWindow $app
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
@@ -410,9 +424,7 @@ try {
     $damaged.focused_pane = 999999
     $damaged | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $directory 'session.json')
     $app = [Diagnostics.Process]::Start($start)
-    Start-Sleep -Seconds 2
-    $app.Refresh()
-    $window = $app.MainWindowHandle
+    $window = Wait-AppWindow $app
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
     $rightTabs = [SelectionUi]::GetDlgItem($window, 306)
     if ((Send $tabs 0x1304) + (Send $rightTabs 0x1304) -ne $damaged.documents.Count) {
@@ -432,9 +444,7 @@ try {
     [IO.File]::WriteAllText([IO.Path]::GetFullPath($fixture), 'synthetic open')
     $start.ArgumentList.Add([IO.Path]::GetFullPath($fixture))
     $app = [Diagnostics.Process]::Start($start)
-    Start-Sleep -Seconds 2
-    $app.Refresh()
-    $window = $app.MainWindowHandle
+    $window = Wait-AppWindow $app
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
@@ -450,9 +460,7 @@ try {
     $start.ArgumentList.RemoveAt(2)
     $start.ArgumentList[1] = Join-Path ([IO.Path]::GetFullPath($directory)) 'last-tab'
     $app = [Diagnostics.Process]::Start($start)
-    Start-Sleep -Seconds 2
-    $app.Refresh()
-    $window = $app.MainWindowHandle
+    $window = Wait-AppWindow $app
     $left = [SelectionUi]::GetDlgItem($window, 101)
     $right = [SelectionUi]::GetDlgItem($window, 102)
     $tabs = [SelectionUi]::GetDlgItem($window, 302)
@@ -460,16 +468,12 @@ try {
     $original = Send $left 2357
     Post $window 0x111 1504
     if ((Send $right 2357) -ne $original -or (Send $left 2357) -eq $original) { throw 'Moving last tab must not silently clone it' }
-    Start-Sleep -Seconds 4
+    Wait-Until { $s = Read-Session $start.ArgumentList[1]; $s -and $s.pane_documents[1].Count -eq 1 } 'Moving the last tab was not autosaved'
     Post $window 0x111 1050
     if ((Send $tabs 0x1304) -ne 2 -or (Send $rightTabs 0x1304) -ne 0) { throw 'Collapsing split lost a tab' }
-    Start-Sleep -Seconds 4
-    $autosaved = Get-Content (Join-Path $start.ArgumentList[1] 'session.json') -Raw | ConvertFrom-Json
-    if ($autosaved.pane_documents[1].Count -ne 0) { throw 'Collapsing split must autosave without text edits' }
+    Wait-Until { $s = Read-Session $start.ArgumentList[1]; $s -and $s.pane_documents[1].Count -eq 0 } 'Collapsing split must autosave without text edits'
     Post $window 0x111 1070
-    Start-Sleep -Seconds 4
-    $autosaved = Get-Content (Join-Path $start.ArgumentList[1] 'session.json') -Raw | ConvertFrom-Json
-    if ($autosaved.pane_documents[1].Count -ne 1) { throw 'Compare group movement must autosave without text edits' }
+    Wait-Until { $s = Read-Session $start.ArgumentList[1]; $s -and $s.pane_documents[1].Count -eq 1 } 'Compare group movement must autosave without text edits'
     Post $window 0x111 1050
     Post $window 0x111 1005
     Post $window 0x111 1005

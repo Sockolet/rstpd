@@ -15,6 +15,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+/// When size and modification time are unchanged, the file is re-hashed at most
+/// this often. Re-hashing every one-second poll would re-read up to 256 MiB per
+/// open file; the cost is that an edit that preserves both size and timestamp is
+/// reported up to this long after it happens.
+const UNCHANGED_STAMP_RECHECK: Duration = Duration::from_secs(5);
+
 pub struct Request {
     pub id: u64,
     pub path: PathBuf,
@@ -75,7 +81,7 @@ impl Scanner {
                     Ok(stamp)
                         if old.stamp.as_ref() == Some(stamp)
                             && old.error.is_none()
-                            && old.checked.elapsed() < Duration::from_secs(5) =>
+                            && old.checked.elapsed() < UNCHANGED_STAMP_RECHECK =>
                     {
                         continue;
                     }
@@ -239,7 +245,12 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(previous_time))
             .unwrap();
-        scanner.files.get_mut(&1).unwrap().checked = Instant::now() - Duration::from_secs(6);
+        assert!(
+            scanner.scan(request(Some(snapshot.hash))).is_empty(),
+            "same-stamp edits are deferred until the recheck window elapses"
+        );
+        scanner.files.get_mut(&1).unwrap().checked =
+            Instant::now() - (UNCHANGED_STAMP_RECHECK + Duration::from_secs(1));
         let changes = scanner.scan(request(Some(snapshot.hash)));
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].baseline_hash, Some(snapshot.hash));
