@@ -121,6 +121,7 @@ const TAB_RIGHT: usize = 1502;
 const MONITOR_FILES: usize = 1503;
 const TAB_SPLIT: usize = 1504;
 const TAB_COMPARE: usize = 1505;
+const TAB_CLONE: usize = 1506;
 const COMPARE_SELECTION: usize = 1510;
 const COMPARE_CLIPBOARD: usize = 1511;
 const COMPARE_SAVED: usize = 1512;
@@ -162,6 +163,8 @@ const TREE_ID: usize = 301;
 const TAB_ID: usize = 302;
 const RESULTS_EDITOR_ID: usize = 105;
 const RESULTS_DIVIDER_ID: usize = 304;
+const RIGHT_TAB_ID: usize = 306;
+const PAINT_MENU_RULE: u32 = WM_APP + 0x37;
 const TOOLBAR: [toolbar::Button; 8] = [
     toolbar::Button {
         command: NEW,
@@ -196,7 +199,7 @@ const TOOLBAR: [toolbar::Button; 8] = [
     toolbar::Button {
         command: COMPARE,
         name: "Compare",
-        tooltip: "Compare active tab with next tab",
+        tooltip: "Compare selected panes (or next tab)",
         icon: Icon::Compare,
     },
     toolbar::Button {
@@ -234,6 +237,68 @@ thread_local! {
     static HOT_BUTTON: Cell<HWND> = const {Cell::new(null_mut())};
     static ICON_ERROR_REPORTED: Cell<bool> = const {Cell::new(false)};
     static TAB_DRAG: Cell<Option<TabDrag>> = const {Cell::new(None)};
+    static SPLIT_BOUNDS: Cell<Option<RECT>> = const { Cell::new(None) };
+    static SPLIT_DRAG_OFFSET: Cell<Option<i32>> = const { Cell::new(None) };
+    static PANEL_BOUNDS: RefCell<Vec<RECT>> = const { RefCell::new(Vec::new()) };
+    static ACTIVE_PANE: Cell<usize> = const { Cell::new(0) };
+}
+
+// The active pane's selected tab carries the accent stripe; repaint both bars when it moves.
+fn select_pane(hwnd: HWND, pane: usize) {
+    let previous = ACTIVE_PANE.with(|active| active.replace(pane));
+    if previous != pane {
+        for id in [TAB_ID, RIGHT_TAB_ID] {
+            unsafe {
+                let tabs = GetDlgItem(hwnd, id as i32);
+                if !tabs.is_null() {
+                    InvalidateRect(tabs, null(), 1);
+                }
+            }
+        }
+    }
+}
+
+fn document_position(documents: &[Document], id: u64) -> Option<usize> {
+    documents.iter().position(|doc| doc.snapshot.id == id)
+}
+
+fn pinned_first(documents: &[Document], group: &mut [u64]) {
+    group.sort_by_key(|id| {
+        !document_position(documents, *id).is_some_and(|index| documents[index].snapshot.pinned)
+    });
+}
+
+fn panel_edges(rect: RECT, split: Option<RECT>) -> Vec<RECT> {
+    let mut edges = vec![
+        RECT {
+            bottom: rect.top + 1,
+            ..rect
+        },
+        RECT {
+            top: rect.bottom - 1,
+            ..rect
+        },
+    ];
+    if !split.is_some_and(|split| rect.left == split.right) {
+        edges.push(RECT {
+            right: rect.left + 1,
+            ..rect
+        });
+    }
+    if !split.is_some_and(|split| rect.right == split.left) {
+        edges.push(RECT {
+            left: rect.right - 1,
+            ..rect
+        });
+    }
+    edges
+}
+
+fn split_hit(x: i32, y: i32) -> Option<i32> {
+    SPLIT_BOUNDS.with(Cell::get).and_then(|rect| {
+        (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+            .then_some(x - rect.left)
+    })
 }
 
 enum Event {
@@ -244,8 +309,9 @@ enum Event {
     Tick,
     Theme,
     Dpi,
-    Tab,
-    CloseTab(usize),
+    Tab(usize),
+    TabFocus(usize),
+    CloseTab(usize, u64),
     Tree(usize),
     Focus(usize),
     Changed(usize),
@@ -260,6 +326,7 @@ enum Event {
     MoveTab(u64, usize),
     PinTab(u64),
     SplitTab(u64),
+    CloneTab(u64),
     CompareTabs(u64, u64),
 }
 fn queue(event: Event) {
@@ -536,9 +603,65 @@ struct Notification {
     modification: i32,
 }
 
+// Native separators lie outside owner-draw menu items. Paint after Windows'
+// nonclient lifecycle, retaining the native menu, keyboard and accessibility.
+unsafe fn paint_menu_rule(hwnd: HWND, supplied: HDC) {
+    unsafe {
+        if !COLORS.with(Cell::get).dark || GetMenu(hwnd).is_null() {
+            return;
+        }
+        let mut window: RECT = zeroed();
+        let mut client: RECT = zeroed();
+        let mut origin = POINT { x: 0, y: 0 };
+        if GetWindowRect(hwnd, &mut window) == 0
+            || GetClientRect(hwnd, &mut client) == 0
+            || ClientToScreen(hwnd, &mut origin) == 0
+        {
+            return;
+        }
+        let dc = if supplied.is_null() {
+            GetWindowDC(hwnd)
+        } else {
+            supplied
+        };
+        if dc.is_null() {
+            return;
+        }
+        let rect = RECT {
+            left: origin.x - window.left,
+            right: origin.x - window.left + client.right,
+            top: origin.y - window.top - 1,
+            bottom: origin.y - window.top,
+        };
+        let brush = CreateSolidBrush(COLORS.with(Cell::get).panel);
+        FillRect(dc, &rect, brush);
+        DeleteObject(brush);
+        if supplied.is_null() {
+            ReleaseDC(hwnd, dc);
+        }
+    }
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match message {
+            PAINT_MENU_RULE => {
+                paint_menu_rule(hwnd, null_mut());
+                return 0;
+            }
+            WM_NCPAINT | WM_NCACTIVATE | WM_SETTEXT | WM_WINDOWPOSCHANGED | WM_EXITMENULOOP
+            | WM_PRINT => {
+                let result = DefWindowProcW(hwnd, message, w, l);
+                paint_menu_rule(
+                    hwnd,
+                    if message == WM_PRINT {
+                        w as HDC
+                    } else {
+                        null_mut()
+                    },
+                );
+                return result;
+            }
             WM_CLOSE => {
                 queue(Event::Close);
                 return 0;
@@ -647,7 +770,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                             _ => {}
                         }
                     }
-                    TAB_ID if header.code == TCN_SELCHANGE => queue(Event::Tab),
+                    TAB_ID | RIGHT_TAB_ID if header.code == TCN_SELCHANGE => {
+                        queue(Event::Tab(usize::from(header.idFrom == RIGHT_TAB_ID)))
+                    }
                     TREE_ID if header.code == TVN_SELCHANGEDW && !TREE_UPDATING.with(Cell::get) => {
                         let n = &*(l as *const NMTREEVIEWW);
                         queue(Event::Tree(n.itemNew.lParam as usize));
@@ -679,6 +804,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 PANEL_BRUSH.with(|b| {
                     FillRect(w as HDC, &rect, b.get());
                 });
+                let palette = COLORS.with(Cell::get);
+                let border = CreateSolidBrush(palette.border);
+                if palette.dark {
+                    PANEL_BOUNDS.with(|bounds| {
+                        for rect in bounds.borrow().iter() {
+                            for edge in panel_edges(*rect, SPLIT_BOUNDS.with(Cell::get)) {
+                                FillRect(w as HDC, &edge, border);
+                            }
+                        }
+                    });
+                }
+                if let Some(mut divider) = SPLIT_BOUNDS.with(Cell::get) {
+                    divider.left += (divider.right - divider.left) / 2;
+                    divider.right = divider.left + (GetDpiForWindow(hwnd) as i32 / 96).max(1);
+                    FillRect(w as HDC, &divider, border);
+                }
+                DeleteObject(border);
                 return 1;
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
@@ -709,6 +851,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             }
             WM_DRAWITEM => {
                 let item = &*(l as *const DRAWITEMSTRUCT);
+                if item.CtlType == ODT_MENU {
+                    PostMessageW(hwnd, PAINT_MENU_RULE, 0, 0);
+                }
                 if item.CtlType == ODT_BUTTON
                     && let Some(button) = TOOLBAR
                         .iter()
@@ -875,17 +1020,44 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 }
             }
             WM_LBUTTONDOWN => {
-                SetCapture(hwnd);
-                queue(Event::SplitDrag((l as i16) as i32));
-                return 0;
+                if let Some(offset) = split_hit(l as i16 as i32, (l >> 16) as i16 as i32) {
+                    SPLIT_DRAG_OFFSET.with(|drag| drag.set(Some(offset)));
+                    SetCapture(hwnd);
+                    SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                    return 0;
+                }
+            }
+            WM_SETCURSOR if w == hwnd as usize && l as u16 == HTCLIENT as u16 => {
+                let mut point: POINT = zeroed();
+                GetCursorPos(&mut point);
+                ScreenToClient(hwnd, &mut point);
+                if split_hit(point.x, point.y).is_some() {
+                    SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                    return 1;
+                }
             }
             WM_MOUSEMOVE if GetCapture() == hwnd => {
-                queue(Event::SplitDrag((l as i16) as i32));
+                if let Some(offset) = SPLIT_DRAG_OFFSET.with(Cell::get) {
+                    SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                    queue(Event::SplitDrag(l as i16 as i32 - offset));
+                }
                 return 0;
             }
             WM_LBUTTONUP if GetCapture() == hwnd => {
+                if let Some(offset) = SPLIT_DRAG_OFFSET.with(|drag| drag.take()) {
+                    queue(Event::SplitDrag(l as i16 as i32 - offset));
+                }
                 ReleaseCapture();
                 return 0;
+            }
+            WM_CAPTURECHANGED => {
+                SPLIT_DRAG_OFFSET.with(|drag| drag.set(None));
+            }
+            WM_CANCELMODE => {
+                SPLIT_DRAG_OFFSET.with(|drag| drag.set(None));
+                if GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
             }
             _ => {}
         }
@@ -1036,6 +1208,7 @@ unsafe extern "system" fn tab_proc(
     _: usize,
 ) -> LRESULT {
     unsafe {
+        let pane = usize::from(GetDlgCtrlID(hwnd) == RIGHT_TAB_ID as i32);
         match message {
             WM_NCHITTEST => {
                 let mut point = POINT {
@@ -1050,6 +1223,7 @@ unsafe extern "system" fn tab_proc(
             }
             WM_LBUTTONDBLCLK if empty_tab_space(hwnd, l as i16 as i32, (l >> 16) as i16 as i32) => {
                 TAB_DRAG.with(|drag| drag.set(None));
+                queue(Event::TabFocus(pane));
                 queue(Event::Command(NEW));
                 return 0;
             }
@@ -1071,6 +1245,19 @@ unsafe extern "system" fn tab_proc(
                     (&mut hit as *mut TCHITTESTINFO) as isize,
                 );
                 if index >= 0 {
+                    let active_tabs = GetDlgItem(
+                        GetParent(hwnd),
+                        if ACTIVE_PANE.with(Cell::get) == 0 {
+                            TAB_ID
+                        } else {
+                            RIGHT_TAB_ID
+                        } as i32,
+                    );
+                    let current = tab_document_id(
+                        active_tabs,
+                        SendMessageW(active_tabs, TCM_GETCURSEL, 0, 0) as usize,
+                    );
+                    queue(Event::TabFocus(pane));
                     let id = tab_document_id(hwnd, index as usize);
                     let menu = CreatePopupMenu();
                     AppendMenuW(menu, MF_STRING, TAB_PIN, wide("Pin / unpin tab").as_ptr());
@@ -1083,8 +1270,12 @@ unsafe extern "system" fn tab_proc(
                         TAB_SPLIT,
                         wide("Open in split view").as_ptr(),
                     );
-                    let current =
-                        tab_document_id(hwnd, SendMessageW(hwnd, TCM_GETCURSEL, 0, 0) as usize);
+                    AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        TAB_CLONE,
+                        wide("Clone to other pane").as_ptr(),
+                    );
                     AppendMenuW(
                         menu,
                         MF_STRING | if current == id { MF_GRAYED } else { 0 },
@@ -1114,6 +1305,8 @@ unsafe extern "system" fn tab_proc(
                         ));
                     } else if action as usize == TAB_SPLIT {
                         queue(Event::SplitTab(id));
+                    } else if action as usize == TAB_CLONE {
+                        queue(Event::CloneTab(id));
                     } else if action as usize == TAB_COMPARE {
                         queue(Event::CompareTabs(current, id));
                     }
@@ -1234,7 +1427,7 @@ unsafe extern "system" fn tab_proc(
                         DT_SINGLELINE | DT_VCENTER | DT_CENTER,
                     );
                     SelectObject(dc, old);
-                    if index == selected {
+                    if index == selected && pane == ACTIVE_PANE.with(Cell::get) {
                         let stripe = RECT {
                             left: rect.left,
                             top: rect.bottom - 2,
@@ -1273,10 +1466,11 @@ unsafe extern "system" fn tab_proc(
                         (&mut rect as *mut RECT) as isize,
                     );
                     if message == WM_MBUTTONUP || x >= rect.right - 23 {
-                        queue(Event::CloseTab(index as usize));
+                        queue(Event::CloseTab(pane, tab_document_id(hwnd, index as usize)));
                         return 0;
                     }
                     if message == WM_LBUTTONDOWN {
+                        queue(Event::TabFocus(pane));
                         TAB_DRAG.with(|drag| {
                             drag.set(Some(TabDrag {
                                 id: tab_document_id(hwnd, index as usize),
@@ -1496,6 +1690,8 @@ struct App {
     scratch: Editor,
     map: Editor,
     tabs: HWND,
+    right_tabs: HWND,
+    groups: [Vec<u64>; 2],
     status: HWND,
     tools: Vec<HWND>,
     tooltips: Option<Tooltips>,
@@ -1629,8 +1825,21 @@ impl App {
             WS_VISIBLE | TCS_OWNERDRAWFIXED | TCS_FIXEDWIDTH | TCS_FOCUSNEVER,
             TAB_ID,
         )?;
+        self.right_tabs = self.control(
+            "SysTabControl32",
+            "",
+            TCS_OWNERDRAWFIXED | TCS_FIXEDWIDTH | TCS_FOCUSNEVER,
+            RIGHT_TAB_ID,
+        )?;
         unsafe {
             SetWindowSubclass(self.tabs, Some(tab_proc), 2, 0);
+            SetWindowSubclass(self.right_tabs, Some(tab_proc), 2, 0);
+            SendMessageW(
+                self.right_tabs,
+                TCM_SETITEMSIZE,
+                0,
+                ((self.scale(34) as isize) << 16) | self.scale(190) as isize,
+            );
         }
         unsafe {
             SendMessageW(
@@ -1855,7 +2064,7 @@ impl App {
                 (
                     "&Tools",
                     &[
-                        (COMPARE, "Compare active tab with next tab"),
+                        (COMPARE, "Compare selected panes (or next tab)"),
                         (COMPARE_SELECTION, "Compare selected lines in both panes"),
                         (COMPARE_CLIPBOARD, "Compare with clipboard"),
                         (COMPARE_SAVED, "Compare with last saved file"),
@@ -2191,6 +2400,7 @@ impl App {
         }
         self.apply_editor_styles();
         self.theme_results();
+        self.layout();
     }
     fn apply_editor_styles(&self) {
         if self.documents.is_empty() {
@@ -2249,6 +2459,7 @@ impl App {
             let mut controls = vec![
                 self.tabs,
                 self.status,
+                self.right_tabs,
                 self.tree,
                 self.search.query,
                 self.search.replace,
@@ -2303,7 +2514,8 @@ impl App {
             let mut rect: RECT = zeroed();
             GetClientRect(self.hwnd, &mut rect);
             let (width, height) = (rect.right, rect.bottom);
-            let toolbar_h = self.scale(42);
+            // Separate the icons from the tabs with breathing room, not another rule.
+            let toolbar_h = self.scale(46);
             let tab_h = self.scale(37);
             let search_layout = SearchLayout::new(width, self.dpi);
             let search_h = if self.search.visible {
@@ -2335,11 +2547,52 @@ impl App {
             };
             let map_w = if self.map_visible { self.scale(115) } else { 0 };
             let content_w = (width - tree_w - map_w).max(1);
-            let gap = self.scale(6);
+            let gap = self.scale(10).max(1);
             let left_w = if self.secondary.is_some() {
                 (content_w as f32 * self.ratio) as i32
             } else {
                 content_w
+            };
+            SPLIT_BOUNDS.with(|bounds| {
+                bounds.set(self.secondary.map(|_| RECT {
+                    left: tree_w + left_w,
+                    top,
+                    right: tree_w + left_w + gap,
+                    bottom: top + body_h,
+                }));
+            });
+            if self.secondary.is_none() {
+                SPLIT_DRAG_OFFSET.with(|drag| drag.set(None));
+                if GetCapture() == self.hwnd {
+                    ReleaseCapture();
+                }
+            }
+            PANEL_BOUNDS.with(|bounds| bounds.borrow_mut().clear());
+            let place_panel = |hwnd, x, y, width: i32, height: i32, top_gap: i32| {
+                let inset = i32::from(self.palette.dark && width > 2 && height > 2);
+                let top_inset = if top_gap > 0 {
+                    top_gap.min(height.max(1))
+                } else {
+                    inset
+                };
+                if inset != 0 {
+                    PANEL_BOUNDS.with(|bounds| {
+                        bounds.borrow_mut().push(RECT {
+                            left: x,
+                            top: y,
+                            right: x + width,
+                            bottom: y + height,
+                        });
+                    });
+                }
+                MoveWindow(
+                    hwnd,
+                    x + inset,
+                    y + top_inset,
+                    (width - 2 * inset).max(0),
+                    (height - top_inset - inset).max(0),
+                    1,
+                );
             };
             for (i, button) in self.tools.iter().enumerate() {
                 MoveWindow(
@@ -2353,7 +2606,23 @@ impl App {
                     1,
                 );
             }
-            MoveWindow(self.tabs, 0, toolbar_h, width, tab_h, 1);
+            MoveWindow(self.tabs, tree_w, toolbar_h, left_w, tab_h, 1);
+            MoveWindow(
+                self.right_tabs,
+                tree_w + left_w + gap,
+                toolbar_h,
+                (content_w - left_w - gap).max(1),
+                tab_h,
+                1,
+            );
+            ShowWindow(
+                self.right_tabs,
+                if self.secondary.is_some() {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
             MoveWindow(
                 self.status,
                 self.scale(10),
@@ -2362,19 +2631,21 @@ impl App {
                 status_h,
                 1,
             );
-            MoveWindow(self.tree, 0, top, tree_w, body_h, 1);
+            // Editors keep a small gap below their tab bars; side panels only use the border inset.
+            let editor_gap = self.scale(3).max(1);
+            place_panel(self.tree, 0, top, tree_w, body_h, 0);
             ShowWindow(self.tree, if self.tree_visible { SW_SHOW } else { SW_HIDE });
             let left_top = (self.compare_top[0] as i32
                 * self.editors[0].send(SCI_TEXTHEIGHT, 0, 0).max(1) as i32)
                 .min(body_h - 1)
                 .max(0);
-            MoveWindow(
+            place_panel(
                 self.editors[0].hwnd,
                 tree_w,
                 top + left_top,
                 left_w,
                 body_h - left_top,
-                1,
+                editor_gap,
             );
             ShowWindow(
                 self.editors[1].hwnd,
@@ -2389,16 +2660,16 @@ impl App {
                     * self.editors[1].send(SCI_TEXTHEIGHT, 0, 0).max(1) as i32)
                     .min(body_h - 1)
                     .max(0);
-                MoveWindow(
+                place_panel(
                     self.editors[1].hwnd,
                     tree_w + left_w + gap,
                     top + right_top,
                     (content_w - left_w - gap).max(1),
                     body_h - right_top,
-                    1,
+                    editor_gap,
                 );
             }
-            MoveWindow(self.map.hwnd, width - map_w, top, map_w, body_h, 1);
+            place_panel(self.map.hwnd, width - map_w, top, map_w, body_h, 0);
             ShowWindow(
                 self.map.hwnd,
                 if self.map_visible { SW_SHOWNA } else { SW_HIDE },
@@ -2578,6 +2849,8 @@ impl App {
                     },
                 );
             }
+            select_pane(self.hwnd, self.focused);
+            InvalidateRect(self.hwnd, null(), 1);
         }
     }
     fn add_document(&mut self, mut snapshot: DocumentSnapshot) -> Result<()> {
@@ -2603,6 +2876,7 @@ impl App {
         self.next_id += 1;
         snapshot.text = String::new();
         let dirty = snapshot.dirty;
+        self.groups[self.focused].push(snapshot.id);
         self.documents.push(Document {
             handle,
             snapshot,
@@ -2613,6 +2887,11 @@ impl App {
             styled_revision: None,
             last_edit: Instant::now(),
         });
+        if self.documents.len() == 1 {
+            self.refresh_views()?;
+            self.editor()
+                .send(SCI_GOTOPOS, self.documents[0].snapshot.caret, 0);
+        }
         self.switch(self.documents.len() - 1)?;
         self.touch();
         Ok(())
@@ -2640,6 +2919,18 @@ impl App {
         if index >= self.documents.len() {
             return Ok(());
         }
+        let id = self.documents[index].snapshot.id;
+        if !self.groups[self.focused].contains(&id) {
+            self.focused = 1 - self.focused;
+        }
+        if self.index() == index {
+            self.focus_pane(self.focused);
+            self.editor().focus();
+            return Ok(());
+        }
+        if self.comparing {
+            self.clear_compare();
+        }
         if self.focused == 1 && self.secondary.is_some() {
             self.secondary = Some(index);
         } else {
@@ -2657,6 +2948,22 @@ impl App {
             self.schedule_json();
         }
         Ok(())
+    }
+    fn focus_pane(&mut self, pane: usize) {
+        if pane > 1 || (pane == 1 && self.secondary.is_none()) {
+            return;
+        }
+        let changed = self.focused != pane;
+        self.focused = pane;
+        self.configure_map();
+        self.update_tabs();
+        self.update_status();
+        if changed {
+            self.touch();
+            if self.tree_visible {
+                self.schedule_json();
+            }
+        }
     }
     fn refresh_views(&mut self) -> Result<()> {
         for (pane, index) in [(0, Some(self.primary)), (1, self.secondary)] {
@@ -2682,18 +2989,45 @@ impl App {
         Ok(())
     }
     fn split_tab(&mut self, id: u64) -> Result<()> {
+        self.transfer_tab(id, false)
+    }
+    fn transfer_tab(&mut self, id: u64, clone: bool) -> Result<()> {
         let index = self
             .documents
             .iter()
             .position(|doc| doc.snapshot.id == id)
             .ok_or("This tab is no longer open.")?;
         self.clear_compare();
-        let other = 1 - self.focused;
+        let source = self.focused;
+        let other = 1 - source;
+        if !clone && self.groups[source].len() == 1 {
+            self.new_document()?;
+        }
+        if !self.groups[other].contains(&id) {
+            self.groups[other].push(id);
+            pinned_first(&self.documents, &mut self.groups[other]);
+        }
+        if !clone {
+            self.groups[source].retain(|entry| *entry != id);
+            if self.index() == index {
+                let replacement = self
+                    .documents
+                    .iter()
+                    .position(|doc| self.groups[source].contains(&doc.snapshot.id))
+                    .ok_or("The source pane has no remaining tab.")?;
+                if source == 0 {
+                    self.primary = replacement;
+                } else {
+                    self.secondary = Some(replacement);
+                }
+            }
+        }
         if other == 1 {
             self.secondary = Some(index);
         } else {
             self.primary = index;
         }
+        self.focused = other;
         self.refresh_views()?;
         self.editors[other].send(SCI_GOTOPOS, self.documents[index].snapshot.caret, 0);
         self.update_tabs();
@@ -2765,35 +3099,41 @@ impl App {
         self.map.send(SCI_SCROLLCARET, 0, 0);
     }
     fn update_tabs(&self) {
+        select_pane(self.hwnd, self.focused);
         unsafe {
-            SendMessageW(self.tabs, WM_SETREDRAW, 0, 0);
-            SendMessageW(self.tabs, TCM_DELETEALLITEMS, 0, 0);
-            for (i, doc) in self.documents.iter().enumerate() {
-                let mut label = wide(&format!(
-                    "{}{}{}{}",
-                    if doc.snapshot.pinned { "[P] " } else { "" },
-                    if self.secondary == Some(i) {
-                        "[R] "
-                    } else {
-                        ""
-                    },
-                    doc.snapshot.title,
-                    if doc.snapshot.dirty { " *" } else { "" }
-                ));
-                let mut item: TCITEMW = zeroed();
-                item.mask = TCIF_TEXT | TCIF_PARAM;
-                item.pszText = label.as_mut_ptr();
-                item.lParam = doc.snapshot.id as isize;
-                SendMessageW(
-                    self.tabs,
-                    TCM_INSERTITEMW,
-                    i,
-                    (&item as *const TCITEMW) as isize,
-                );
+            for (pane, tab) in [self.tabs, self.right_tabs].into_iter().enumerate() {
+                SendMessageW(tab, WM_SETREDRAW, 0, 0);
+                SendMessageW(tab, TCM_DELETEALLITEMS, 0, 0);
+                let visible = if pane == 0 {
+                    Some(self.primary)
+                } else {
+                    self.secondary
+                };
+                let mut selected = 0;
+                let entries = self.groups[pane].iter().filter_map(|id| {
+                    document_position(&self.documents, *id)
+                        .map(|index| (index, &self.documents[index]))
+                });
+                for (i, (index, doc)) in entries.enumerate() {
+                    if Some(index) == visible {
+                        selected = i;
+                    }
+                    let mut label = wide(&format!(
+                        "{}{}{}",
+                        if doc.snapshot.pinned { "[P] " } else { "" },
+                        doc.snapshot.title,
+                        if doc.snapshot.dirty { " *" } else { "" }
+                    ));
+                    let mut item: TCITEMW = zeroed();
+                    item.mask = TCIF_TEXT | TCIF_PARAM;
+                    item.pszText = label.as_mut_ptr();
+                    item.lParam = doc.snapshot.id as isize;
+                    SendMessageW(tab, TCM_INSERTITEMW, i, (&item as *const TCITEMW) as isize);
+                }
+                SendMessageW(tab, TCM_SETCURSEL, selected, 0);
+                SendMessageW(tab, WM_SETREDRAW, 1, 0);
+                InvalidateRect(tab, null(), 1);
             }
-            SendMessageW(self.tabs, TCM_SETCURSEL, self.index(), 0);
-            SendMessageW(self.tabs, WM_SETREDRAW, 1, 0);
-            InvalidateRect(self.tabs, null(), 1);
         }
         let doc = &self.documents[self.index()];
         set_text(
@@ -2816,17 +3156,26 @@ impl App {
             .secondary
             .map(|index| self.documents[index].snapshot.id);
         if let Some(requested) = requested {
-            let pins: Vec<_> = self
-                .documents
+            let group = &mut self.groups[self.focused];
+            let local = group
                 .iter()
-                .map(|doc| doc.snapshot.pinned)
+                .position(|entry| *entry == id)
+                .ok_or("Tab is outside this pane.")?;
+            let pins: Vec<_> = group
+                .iter()
+                .map(|id| {
+                    document_position(&self.documents, *id)
+                        .is_some_and(|index| self.documents[index].snapshot.pinned)
+                })
                 .collect();
-            let target = tabs::move_target(&pins, from, requested)?;
-            let document = self.documents.remove(from);
-            self.documents.insert(target, document);
+            let target = tabs::move_target(&pins, local, requested)?;
+            let id = group.remove(local);
+            group.insert(target, id);
         } else {
             self.documents[from].snapshot.pinned = !self.documents[from].snapshot.pinned;
-            self.documents.sort_by_key(|doc| !doc.snapshot.pinned);
+            for group in &mut self.groups {
+                pinned_first(&self.documents, group);
+            }
         }
         self.primary = self
             .documents
@@ -3174,6 +3523,21 @@ impl App {
     }
     fn close_document(&mut self) -> Result<()> {
         let index = self.index();
+        let id = self.documents[index].snapshot.id;
+        if self.groups[1 - self.focused].contains(&id) {
+            self.clear_compare();
+            self.groups[self.focused].retain(|entry| *entry != id);
+            self.normalize_groups();
+            self.refresh_views()?;
+            self.update_tabs();
+            self.update_status();
+            self.editor().focus();
+            self.touch();
+            if self.tree_visible {
+                self.schedule_json();
+            }
+            return Ok(());
+        }
         if self.documents[index].snapshot.dirty {
             match ask(
                 self.hwnd,
@@ -3194,6 +3558,9 @@ impl App {
             self.new_document()?;
         }
         let closed = self.documents.remove(index);
+        for group in &mut self.groups {
+            group.retain(|entry| *entry != id);
+        }
         if self.results.data.as_ref().is_some_and(|results| {
             results
                 .files
@@ -3219,6 +3586,7 @@ impl App {
                 Some(i)
             }
         });
+        self.normalize_groups();
         if self.secondary.is_none() {
             self.focused = 0;
             self.editors[1].attach(&self.documents[self.primary].handle);
@@ -3233,6 +3601,7 @@ impl App {
         self.touch();
         self.update_tabs();
         self.update_status();
+        self.editor().focus();
         if self.tree_visible {
             self.schedule_json();
         }
@@ -3264,7 +3633,50 @@ impl App {
                 .filter_map(|language| language.custom.as_deref().cloned())
                 .collect(),
             completion_api: self.completion_api.clone(),
+            pane_documents: self.groups.clone().map(|group| {
+                group
+                    .iter()
+                    .filter_map(|id| document_position(&self.documents, *id))
+                    .collect()
+            }),
+            pane_selected: [self.primary, self.secondary.unwrap_or(0)],
+            focused_pane: self.focused,
         })
+    }
+    fn normalize_groups(&mut self) {
+        for group in &mut self.groups {
+            let mut seen = HashSet::new();
+            group
+                .retain(|id| seen.insert(*id) && document_position(&self.documents, *id).is_some());
+            pinned_first(&self.documents, group);
+        }
+        if self.groups[0].is_empty() {
+            self.groups.swap(0, 1);
+            self.primary = self.secondary.unwrap_or(0);
+            self.focused = 0;
+        }
+        let first = |pane: usize| {
+            self.documents
+                .iter()
+                .position(|doc| self.groups[pane].contains(&doc.snapshot.id))
+        };
+        if !self
+            .documents
+            .get(self.primary)
+            .is_some_and(|doc| self.groups[0].contains(&doc.snapshot.id))
+        {
+            self.primary = first(0).unwrap_or(0);
+        }
+        if self.groups[1].is_empty() {
+            self.secondary = None;
+            self.focused = 0;
+        } else if !self
+            .secondary
+            .and_then(|i| self.documents.get(i))
+            .is_some_and(|doc| self.groups[1].contains(&doc.snapshot.id))
+        {
+            self.secondary = first(1);
+        }
     }
     fn search_settings(&self) -> Result<Search> {
         let mode = unsafe { SendMessageW(self.search.mode, CB_GETCURSEL, 0, 0) };
@@ -3811,7 +4223,18 @@ impl App {
             return Err("Open two documents in separate tabs to compare.".into());
         }
         let left = self.index();
-        self.begin_compare(left, (left + 1) % self.documents.len())
+        if let Some(right) = self.secondary.filter(|right| *right != self.primary) {
+            self.begin_compare(self.primary, right)
+        } else {
+            let group = &self.groups[self.focused];
+            let current = group
+                .iter()
+                .position(|id| *id == self.documents[left].snapshot.id)
+                .ok_or("The current document is outside the focused pane.")?;
+            let right = document_position(&self.documents, group[(current + 1) % group.len()])
+                .ok_or("The next tab is no longer open.")?;
+            self.begin_compare(left, right)
+        }
     }
     fn begin_compare(&mut self, left: usize, right: usize) -> Result<()> {
         if left == right || left >= self.documents.len() || right >= self.documents.len() {
@@ -3819,12 +4242,24 @@ impl App {
         }
         self.compare_options.validate()?;
         self.clear_compare();
+        let left_id = self.documents[left].snapshot.id;
+        let right_id = self.documents[right].snapshot.id;
+        self.groups[1].retain(|id| *id != left_id);
+        self.groups[0].retain(|id| *id != right_id);
+        if !self.groups[0].contains(&left_id) {
+            self.groups[0].push(left_id);
+        }
+        if !self.groups[1].contains(&right_id) {
+            self.groups[1].push(right_id);
+        }
         self.primary = left;
         self.focused = 0;
         self.secondary = Some(right);
+        self.normalize_groups();
         self.refresh_views()?;
         self.update_tabs();
         self.editor().focus();
+        self.touch();
         self.comparing = true;
         self.compare_jump = true;
         self.launch_compare()
@@ -3898,14 +4333,7 @@ impl App {
             caret: 0,
             pinned: false,
         })?;
-        self.primary = original;
-        self.secondary = Some(self.documents.len() - 1);
-        self.focused = 0;
-        self.comparing = true;
-        self.compare_jump = true;
-        self.refresh_views()?;
-        self.update_tabs();
-        self.launch_compare()
+        self.begin_compare(original, self.documents.len() - 1)
     }
     fn change_compare_options(&mut self, command: usize) -> Result<()> {
         let mut options = self.compare_options.clone();
@@ -4445,16 +4873,6 @@ impl App {
                 self.save_document(true)?;
             }
             CLOSE => self.close_document()?,
-            TAB_PIN => self.reorder_tabs(self.documents[self.index()].snapshot.id, None)?,
-            TAB_LEFT | TAB_RIGHT => {
-                let index = self.index();
-                let target = if command == TAB_LEFT {
-                    index.saturating_sub(1)
-                } else {
-                    (index + 1).min(self.documents.len() - 1)
-                };
-                self.reorder_tabs(self.documents[index].snapshot.id, Some(target))?;
-            }
             MONITOR_FILES => {
                 self.monitor_files = !self.monitor_files;
                 if self.monitor_files {
@@ -4568,19 +4986,43 @@ impl App {
             REPLACE_ALL => self.replace(true)?,
             SPLIT => {
                 self.clear_compare();
-                self.secondary = if self.secondary.is_some() {
-                    None
-                } else {
-                    Some(self.primary)
-                };
-                if self.secondary.is_none() {
+                if self.secondary.is_some() {
+                    for id in std::mem::take(&mut self.groups[1]) {
+                        if !self.groups[0].contains(&id) {
+                            self.groups[0].push(id);
+                        }
+                    }
+                    self.primary = self.index();
+                    self.secondary = None;
                     self.focused = 0;
+                } else {
+                    self.split_tab(self.documents[self.index()].snapshot.id)?;
                 }
+                self.normalize_groups();
                 self.refresh_views()?;
                 self.update_tabs();
+                self.editor().focus();
+                self.touch();
                 self.note(
-                    "Click a pane, then a tab, to choose that pane's document. F6 switches panes.",
+                    "Each pane has its own tabs. Open in split moves a tab; Clone explicitly shares it. F6 switches panes.",
                 );
+            }
+            TAB_SPLIT => self.split_tab(self.documents[self.index()].snapshot.id)?,
+            TAB_CLONE => self.transfer_tab(self.documents[self.index()].snapshot.id, true)?,
+            TAB_PIN => self.reorder_tabs(self.documents[self.index()].snapshot.id, None)?,
+            TAB_LEFT | TAB_RIGHT => {
+                let id = self.documents[self.index()].snapshot.id;
+                let group = &self.groups[self.focused];
+                let position = group
+                    .iter()
+                    .position(|entry| *entry == id)
+                    .ok_or("The current tab is outside the focused pane.")?;
+                let target = if command == TAB_LEFT {
+                    position.saturating_sub(1)
+                } else {
+                    (position + 1).min(group.len() - 1)
+                };
+                self.reorder_tabs(id, Some(target))?;
             }
             MAP => {
                 self.map_visible = !self.map_visible;
@@ -4811,16 +5253,21 @@ impl App {
             return Ok(true);
         }
         if control && key == VK_TAB {
-            let len = self.documents.len();
-            let index = (self.index() + if shift { len - 1 } else { 1 }) % len;
-            self.switch(index)?;
+            let indices: Vec<_> = self.groups[self.focused]
+                .iter()
+                .filter_map(|id| document_position(&self.documents, *id))
+                .collect();
+            if indices.is_empty() {
+                return Ok(true);
+            }
+            let current = indices.iter().position(|i| *i == self.index()).unwrap_or(0);
+            let next = (current + if shift { indices.len() - 1 } else { 1 }) % indices.len();
+            self.switch(indices[next])?;
             return Ok(true);
         }
         if key == VK_F6 && self.secondary.is_some() {
-            self.focused = 1 - self.focused;
+            self.focus_pane(1 - self.focused);
             self.editor().focus();
-            self.configure_map();
-            self.update_tabs();
             return Ok(true);
         }
         if control && key == VK_SPACE {
@@ -5000,34 +5447,52 @@ impl App {
                 self.set_font();
                 self.layout();
             }
-            Event::Tab => {
-                let selected = unsafe { SendMessageW(self.tabs, TCM_GETCURSEL, 0, 0) };
-                if selected >= 0 {
-                    if self.comparing {
-                        self.clear_compare();
-                    }
-                    self.switch(selected as usize)?;
-                }
-            }
-            Event::Focus(pane) => {
-                if pane == 0 || self.secondary.is_some() {
-                    let changed = self.focused != pane;
-                    self.focused = pane;
-                    self.configure_map();
-                    self.update_tabs();
-                    self.update_status();
-                    if changed && self.tree_visible {
+            Event::TabFocus(pane) => {
+                let changed = self.focused != pane;
+                self.focused = pane;
+                self.editor().focus();
+                select_pane(self.hwnd, pane);
+                self.update_status();
+                if changed {
+                    self.touch();
+                    if self.tree_visible {
                         self.schedule_json();
                     }
                 }
             }
-            Event::CloseTab(index) => {
-                self.switch(index)?;
-                self.close_document()?;
+            Event::Tab(pane) => {
+                let tab = [self.tabs, self.right_tabs][pane];
+                let selected = unsafe { SendMessageW(tab, TCM_GETCURSEL, 0, 0) };
+                if selected >= 0 {
+                    let id = unsafe { tab_document_id(tab, selected as usize) };
+                    self.focused = pane;
+                    if self.comparing {
+                        self.clear_compare();
+                    }
+                    if let Some(index) = self.documents.iter().position(|doc| doc.snapshot.id == id)
+                    {
+                        self.switch(index)?;
+                    }
+                }
+            }
+            Event::Focus(pane) => {
+                // Focus notifications are queued. Ignore a view that has already
+                // lost focus to a later tab/keyboard action.
+                if pane < 2 && unsafe { GetFocus() } == self.editors[pane].hwnd {
+                    self.focus_pane(pane);
+                }
+            }
+            Event::CloseTab(pane, id) => {
+                self.focused = pane;
+                if let Some(index) = self.documents.iter().position(|doc| doc.snapshot.id == id) {
+                    self.switch(index)?;
+                    self.close_document()?;
+                }
             }
             Event::MoveTab(id, target) => self.reorder_tabs(id, Some(target))?,
             Event::PinTab(id) => self.reorder_tabs(id, None)?,
             Event::SplitTab(id) => self.split_tab(id)?,
+            Event::CloneTab(id) => self.transfer_tab(id, true)?,
             Event::CompareTabs(current, target) => self.compare_tabs(current, target)?,
             Event::Updated(pane) => {
                 self.editors[pane].update_line_number_margin();
@@ -5385,6 +5850,8 @@ pub fn run() -> Result<()> {
             scratch,
             map,
             tabs: null_mut(),
+            right_tabs: null_mut(),
+            groups: Default::default(),
             status: null_mut(),
             tools: Vec::new(),
             tooltips: None,
@@ -5463,10 +5930,14 @@ pub fn run() -> Result<()> {
             app.import_language(&path)?;
         }
         let active = session.active;
+        let pane_documents = session.pane_documents;
+        let pane_selected = session.pane_selected;
+        let focused_pane = session.focused_pane.min(1);
         for snapshot in session.documents {
             app.add_document(snapshot)?;
         }
         if !app.documents.is_empty() {
+            let original_ids: Vec<_> = app.documents.iter().map(|doc| doc.snapshot.id).collect();
             let active_id = app.documents[active.min(app.documents.len() - 1)]
                 .snapshot
                 .id;
@@ -5477,6 +5948,30 @@ pub fn run() -> Result<()> {
                 .position(|doc| doc.snapshot.id == active_id)
                 .expect("restored active tab");
             app.switch(active.min(app.documents.len() - 1))?;
+            if pane_documents.iter().any(|group| !group.is_empty()) {
+                app.groups = pane_documents.map(|group| {
+                    group
+                        .into_iter()
+                        .filter_map(|i| original_ids.get(i).copied())
+                        .collect()
+                });
+                for id in &original_ids {
+                    if !app.groups.iter().any(|group| group.contains(id)) {
+                        app.groups[0].push(*id);
+                    }
+                }
+                let selected = pane_selected.map(|i| {
+                    original_ids
+                        .get(i)
+                        .and_then(|id| app.documents.iter().position(|doc| doc.snapshot.id == *id))
+                });
+                app.primary = selected[0].unwrap_or(0);
+                app.secondary = selected[1];
+                app.focused = focused_pane;
+            }
+            app.normalize_groups();
+            app.refresh_views()?;
+            app.update_tabs();
         }
         for path in paths {
             if let Err(error) = app.open_path(&path, None) {
@@ -5532,6 +6027,173 @@ pub fn run() -> Result<()> {
         PANEL_BRUSH.with(|b| DeleteObject(b.replace(null_mut())));
         FIELD_BRUSH.with(|b| DeleteObject(b.replace(null_mut())));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn chrome_has_one_separator_and_no_pane_accent_when_focus_changes() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            let screen = GetDC(hwnd);
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 100, 100);
+            assert!(!dc.is_null() && !bitmap.is_null());
+            let old_bitmap = SelectObject(dc, bitmap);
+            let old_palette = COLORS.with(Cell::get);
+            let old_brush = PANEL_BRUSH.with(Cell::get);
+            PANEL_BOUNDS.with(|bounds| {
+                bounds.borrow_mut().push(RECT {
+                    left: 5,
+                    top: 5,
+                    right: 40,
+                    bottom: 95,
+                });
+                bounds.borrow_mut().push(RECT {
+                    left: 50,
+                    top: 5,
+                    right: 95,
+                    bottom: 95,
+                });
+            });
+            SPLIT_BOUNDS.with(|bounds| {
+                bounds.set(Some(RECT {
+                    left: 40,
+                    top: 5,
+                    right: 50,
+                    bottom: 95,
+                }));
+            });
+            for dark in [true, false] {
+                let palette = Palette::new(dark);
+                let brush = CreateSolidBrush(palette.panel);
+                COLORS.with(|colors| colors.set(palette));
+                PANEL_BRUSH.with(|panel| panel.set(brush));
+                // Focus still tracks the physical pane without painting a pane-wide accent.
+                for active in [0, 1, 0] {
+                    select_pane(hwnd, active);
+                    window_proc(hwnd, WM_ERASEBKGND, dc as usize, 0);
+                    assert_eq!(GetPixel(dc, 45, 20), palette.border);
+                    for x in [39, 40, 42, 49, 50] {
+                        assert_eq!(GetPixel(dc, x, 20), palette.panel);
+                    }
+                    assert_eq!(
+                        GetPixel(dc, 5, 20),
+                        if dark { palette.border } else { palette.panel }
+                    );
+                    assert_eq!(ACTIVE_PANE.with(Cell::get), active);
+                    for x in [10, 60] {
+                        assert_eq!(GetPixel(dc, x, 6), palette.panel);
+                    }
+                }
+                DeleteObject(brush);
+            }
+            COLORS.with(|colors| colors.set(old_palette));
+            PANEL_BRUSH.with(|panel| panel.set(old_brush));
+            PANEL_BOUNDS.with(|bounds| bounds.borrow_mut().clear());
+            SPLIT_BOUNDS.with(|bounds| bounds.set(None));
+            ACTIVE_PANE.with(|active| active.set(0));
+            SelectObject(dc, old_bitmap);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(hwnd, screen);
+            DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn divider_hit_area_excludes_chrome_and_preserves_grab_offset() {
+        SPLIT_BOUNDS.with(|bounds| {
+            bounds.set(Some(RECT {
+                left: 400,
+                top: 79,
+                right: 410,
+                bottom: 600,
+            }));
+        });
+        for (x, y) in [(399, 100), (410, 100), (405, 78), (405, 600)] {
+            assert_eq!(split_hit(x, y), None);
+        }
+        assert_eq!(split_hit(400, 79), Some(0));
+        assert_eq!(split_hit(409, 599), Some(9));
+        SPLIT_BOUNDS.with(|bounds| bounds.set(None));
+        assert_eq!(split_hit(405, 100), None);
+    }
+
+    #[test]
+    fn only_divider_drags_queue_resizes_and_capture_loss_stops_them() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                800,
+                600,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            let point = |x: i32, y: i32| (x as u16 as isize) | ((y as isize) << 16);
+            SPLIT_BOUNDS.with(|bounds| {
+                bounds.set(Some(RECT {
+                    left: 400,
+                    top: 79,
+                    right: 410,
+                    bottom: 500,
+                }));
+            });
+            EVENTS.with(|events| events.borrow_mut().clear());
+            window_proc(hwnd, WM_LBUTTONDOWN, 0, point(405, 20));
+            assert_ne!(GetCapture(), hwnd);
+            window_proc(hwnd, WM_LBUTTONDOWN, 0, point(408, 100));
+            assert_eq!(GetCapture(), hwnd);
+            assert!(EVENTS.with(|events| events.borrow().is_empty()));
+            window_proc(hwnd, WM_MOUSEMOVE, MK_LBUTTON as usize, point(508, 100));
+            assert!(EVENTS.with(|events| matches!(
+                events.borrow_mut().pop_front(),
+                Some(Event::SplitDrag(500))
+            )));
+            window_proc(hwnd, WM_LBUTTONUP, 0, point(518, 100));
+            assert_ne!(GetCapture(), hwnd);
+            assert!(EVENTS.with(|events| matches!(
+                events.borrow_mut().pop_front(),
+                Some(Event::SplitDrag(510))
+            )));
+            window_proc(hwnd, WM_LBUTTONDOWN, 0, point(402, 100));
+            window_proc(hwnd, WM_CANCELMODE, 0, 0);
+            assert_ne!(GetCapture(), hwnd);
+            assert_eq!(SPLIT_DRAG_OFFSET.with(Cell::get), None);
+            window_proc(hwnd, WM_LBUTTONDOWN, 0, point(402, 100));
+            ReleaseCapture();
+            window_proc(hwnd, WM_CAPTURECHANGED, 0, 0);
+            assert_eq!(SPLIT_DRAG_OFFSET.with(Cell::get), None);
+            window_proc(hwnd, WM_MOUSEMOVE, MK_LBUTTON as usize, point(600, 100));
+            assert!(EVENTS.with(|events| events.borrow().is_empty()));
+            SPLIT_BOUNDS.with(|bounds| bounds.set(None));
+            DestroyWindow(hwnd);
+        }
     }
 }
 

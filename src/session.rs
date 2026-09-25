@@ -63,6 +63,12 @@ pub struct Session {
     pub custom_languages: Vec<crate::udl::UserLanguage>,
     #[serde(default)]
     pub completion_api: Vec<crate::completion::Api>,
+    #[serde(default)]
+    pub pane_documents: [Vec<usize>; 2],
+    #[serde(default)]
+    pub pane_selected: [usize; 2],
+    #[serde(default)]
+    pub focused_pane: usize,
 }
 
 fn monitor_enabled() -> bool {
@@ -270,6 +276,26 @@ impl Drop for RecoveryWorker {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pane_metadata_round_trips_and_legacy_defaults() {
+        let session = super::Session {
+            pane_documents: [vec![2, 0], vec![1, 2]],
+            pane_selected: [0, 2],
+            focused_pane: 1,
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&session).unwrap();
+        let restored: super::Session = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.pane_documents, session.pane_documents);
+        assert_eq!(restored.pane_selected, [0, 2]);
+        assert_eq!(restored.focused_pane, 1);
+        for field in ["pane_documents", "pane_selected", "focused_pane"] {
+            json.as_object_mut().unwrap().remove(field);
+        }
+        let legacy: super::Session = serde_json::from_value(json).unwrap();
+        assert!(legacy.pane_documents.iter().all(Vec::is_empty));
+        assert_eq!(legacy.focused_pane, 0);
+    }
     use super::*;
 
     #[test]

@@ -233,24 +233,41 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
         left.set_text("line numbers\n").unwrap();
         left.language_with_font(rust, Palette::new(false), &large_font)
             .unwrap();
-        let four_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"9999".as_ptr() as isize);
-        assert!(
-            four_digits + 12 > 52,
-            "32 pt line numbers exceed the old fixed margin."
+        let two_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99".as_ptr() as isize);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            two_digits + (two_digits / 2).max(4)
         );
-        assert_eq!(left.send(SCI_GETMARGINWIDTHN, 0, 0), four_digits + 12);
+        left.set_text(&"\n".repeat(98)).unwrap();
+        left.update_line_number_margin();
+        let compact_width = left.send(SCI_GETMARGINWIDTHN, 0, 0);
+        assert_eq!(compact_width, two_digits + (two_digits / 2).max(4));
+        left.set_text(&"\n".repeat(99)).unwrap();
+        left.update_line_number_margin();
+        let three_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"999".as_ptr() as isize);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            three_digits + (three_digits / 3).max(4)
+        );
+        assert!(left.send(SCI_GETMARGINWIDTHN, 0, 0) > compact_width);
 
         left.set_text(&"\n".repeat(9999)).unwrap();
         assert_eq!(left.send(SCI_GETLINECOUNT, 0, 0), 10_000);
         left.update_line_number_margin();
         let five_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99999".as_ptr() as isize);
-        assert!(five_digits > four_digits);
-        assert_eq!(left.send(SCI_GETMARGINWIDTHN, 0, 0), five_digits + 12);
+        assert!(five_digits > three_digits);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            five_digits + (five_digits / 5).max(4)
+        );
         left.send(SCI_SETZOOM, 4, 0);
         left.update_line_number_margin();
         let zoomed_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99999".as_ptr() as isize);
         assert!(zoomed_digits > five_digits);
-        assert_eq!(left.send(SCI_GETMARGINWIDTHN, 0, 0), zoomed_digits + 12);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            zoomed_digits + (zoomed_digits / 5).max(4)
+        );
         right.theme_with_font(
             rust,
             Palette::new(false),
@@ -260,9 +277,19 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
         let small_digits = right.send_raw(SCI_TEXTWIDTH, 33, c"99999".as_ptr() as isize);
         assert_eq!(
             right.send(SCI_GETMARGINWIDTHN, 0, 0),
-            (small_digits + 12).max(52)
+            small_digits + (small_digits / 5).max(4)
         );
         assert!(left.send(SCI_GETMARGINWIDTHN, 0, 0) > right.send(SCI_GETMARGINWIDTHN, 0, 0));
+        left.set_text("").unwrap();
+        left.send(SCI_SETZOOM, 0, 0);
+        left.theme_with_font(rust, Palette::new(true), &EditorFont::default());
+        let compact_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99".as_ptr() as isize);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            compact_digits + (compact_digits / 2).max(4)
+        );
+        assert!(left.send(SCI_GETMARGINWIDTHN, 0, 0) < 52);
+        assert_eq!(left.send(SCI_GETMARGINWIDTHN, 2, 0), 16);
         assert_eq!(left.send(SCI_GETMODIFY, 0, 0), 0);
         assert_eq!(left.send(SCI_CANUNDO, 0, 0), 0);
         DestroyWindow(parent);

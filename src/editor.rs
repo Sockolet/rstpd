@@ -294,7 +294,7 @@ impl Editor {
             editor.send(message, value, 0);
         }
         editor.send(SCI_SETMARGINTYPEN, 0, 1);
-        editor.send(SCI_SETMARGINWIDTHN, 0, 52);
+        editor.update_line_number_margin();
         editor.send(SCI_SETMARGINWIDTHN, 1, 0);
         editor.send(SCI_SETMARGINWIDTHN, 2, 16);
         editor.send(SCI_SETMARGINMASKN, 2, 0xfe000000_u32 as isize);
@@ -891,10 +891,16 @@ impl Editor {
         self.update_line_number_margin();
     }
     pub fn update_line_number_margin(self) {
-        let digits = self.send(SCI_GETLINECOUNT, 0, 0).to_string().len().max(4);
+        let digits = self
+            .send(SCI_GETLINECOUNT, 0, 0)
+            .max(1)
+            .to_string()
+            .len()
+            .max(2);
         let sample = CString::new("9".repeat(digits)).expect("line-number digits");
         let measured = unsafe { self.send_raw(SCI_TEXTWIDTH, 33, sample.as_ptr() as isize) };
-        let width = (measured + 12).max(52);
+        let padding = (measured / digits as isize).max(4);
+        let width = measured + padding;
         if self.send(SCI_GETMARGINWIDTHN, 0, 0) != width {
             self.send(SCI_SETMARGINWIDTHN, 0, width);
         }
