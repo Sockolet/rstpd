@@ -17,13 +17,13 @@ Download the portable Windows ZIP from the
 [GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\rstpd-1.4.2\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-1.4.2\rstpd.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-1.4.3\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-1.4.3\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\rstpd-1.4.2\rstpd.exe
-.\dist\rstpd-1.4.2\rstpd.exe .\example.rs .\example.json
+.\dist\rstpd-1.4.3\rstpd.exe
+.\dist\rstpd-1.4.3\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
@@ -103,6 +103,9 @@ tab, Split shows that document in both panes instead of leaving a blank tab.
 Toggling an existing split off merges both groups without discarding documents.
 Recovery stores both groups, ordering, selections, and focused pane. Older
 recovery files without group metadata open all their documents in the left group.
+Unusable pane references/selections are repaired without dropping documents:
+invalid or duplicate references are removed and unassigned documents return
+to the left group. One document may still appear in both groups as a clone.
 
 **Compare with current view**
 compares the document active before the right-click against the clicked tab,
@@ -319,11 +322,13 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\rstpd-1.4.2\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-1.4.2\rstpd.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-1.4.3\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-1.4.3\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
+Parameter hints keep Rust turbofish generic commas separate from call arguments.
+Comparisons such as `text == ""` do not override an annotated receiver type.
 
 ## Keyboard
 
@@ -382,6 +387,8 @@ Invalid recovery files are never edited or deleted. At startup, rstpd renames
 an invalid `session.json` to `session.invalid-<timestamp>.json` in the same
 folder, reports the new name, and starts with an empty session. If the recovery
 file cannot be read or renamed, startup stops and reports the error instead.
+Quarantine never overwrites an earlier copy, including if its name appears
+between choosing the name and moving the invalid file.
 On reopen, named tabs use their recovery snapshots; a changed disk version is
 not silently substituted for the recovered text.
 
@@ -428,7 +435,7 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-1.4.2-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-1.4.3-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.
@@ -454,6 +461,8 @@ session files without accessing your real recovery data. Own-window screenshots
 are written to `target`.
 Markdown checks verify rendered colors/font attributes in light/dark themes,
 live editing, split/map views and recovery, rather than only checking lexer IDs.
+`tests\parity_contract.rs` runs the same completion, encoding-hint, pane-layout
+and recovery-quarantine contracts in this repository and the GTK sibling.
 
 `tests\ui_selection.ps1` exercises native pane groups, keyboard navigation,
 move/clone actions, comparison, and recovery with an isolated synthetic session.

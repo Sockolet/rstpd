@@ -259,15 +259,33 @@ fn quarantine(path: &Path, stamp: u64) -> Result<PathBuf> {
             format!("{stem}.invalid-{stamp}-{attempt}.json")
         };
         let target = parent.join(name);
-        if target
-            .try_exists()
-            .map_err(|e| format!("Could not inspect {}: {e}", target.display()))?
-        {
-            continue;
+        #[cfg(windows)]
+        let moved = {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+            let from: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to: Vec<_> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        #[cfg(not(windows))]
+        let moved = if target.try_exists().map_err(|error| error.to_string())? {
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        } else {
+            fs::rename(path, &target)
+        };
+        match moved {
+            Ok(()) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "The invalid recovery file could not be moved aside: {error}"
+                ));
+            }
         }
-        fs::rename(path, &target)
-            .map_err(|e| format!("The invalid recovery file could not be moved aside: {e}"))?;
-        return Ok(target);
     }
     Err("Could not choose a name for the invalid recovery file.".into())
 }

@@ -1315,6 +1315,7 @@ mod tests {
         unpaired.extend_from_slice(b"\0\xd8");
         assert_eq!(bomless_utf16_hint(&unpaired), None);
         assert_eq!(decode(b"a\0b\0", None).unwrap().1, Encoding::Utf8);
+        assert_eq!(decode(b"a\0b\0", Some(&Encoding::Utf16Le)).unwrap().0, "ab");
     }
     #[test]
     fn malformed_and_lossy_encoding_is_rejected() {

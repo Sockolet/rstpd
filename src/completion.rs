@@ -770,18 +770,25 @@ mod tests {
 
     #[test]
     fn turbofish_commas_and_comparisons_do_not_shift_call_tip_arguments() {
-        let text = "fn f(a: i32, b: i32, c: i32) {}\nf(g::<A, B>(), ";
-        let tip = call_tip(text, text.len(), "Rust", &[]).unwrap();
-        assert_eq!(tip.signature[tip.parameter].trim(), "b: i32");
-        let text = "fn f(a: i32, b: i32, c: i32) {}\nf(x < y, ";
-        let tip = call_tip(text, text.len(), "Rust", &[]).unwrap();
-        assert_eq!(tip.signature[tip.parameter].trim(), "b: i32");
+        for (suffix, parameter) in [
+            ("f(g::<A, B>(), ", "b: i32"),
+            ("f(x < y, ", "b: i32"),
+            ("f(g::<A, B>(), x < y, ", "c: i32"),
+        ] {
+            let text = format!("fn f(a: i32, b: i32, c: i32) {{}}\n{suffix}");
+            let tip = call_tip(&text, text.len(), "Rust", &[]).unwrap();
+            assert_eq!(tip.signature[tip.parameter].trim(), parameter);
+        }
     }
 
     #[test]
     fn comparisons_do_not_replace_annotated_receiver_types() {
-        let text = "let text: String = String::new();\nif text == \"\" {}\ntext.tr";
-        let words = suggestions(text, text.len(), "Rust", &[], &[], false).words;
-        assert!(words.contains(&"trim".into()), "{words:?}");
+        for comparison in ["==", "!=", ">="] {
+            let text = format!(
+                "let text: String = String::new();\nif text {comparison} \"\" {{}}\ntext.tr"
+            );
+            let words = suggestions(&text, text.len(), "Rust", &[], &[], false).words;
+            assert!(words.contains(&"trim".into()), "{words:?}");
+        }
     }
 }
