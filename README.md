@@ -17,18 +17,23 @@ Download the portable Windows ZIP from the
 [GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\rstpd-1.4.1\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-1.4.1\rstpd.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-1.4.2\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-1.4.2\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\rstpd-1.4.1\rstpd.exe
-.\dist\rstpd-1.4.1\rstpd.exe .\example.rs .\example.json
+.\dist\rstpd-1.4.2\rstpd.exe
+.\dist\rstpd-1.4.2\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
-instance may use a session directory at a time. Opening another instance
-does not forward filenames to the existing instance.
+instance may use a session directory at a time. Launching again with the same
+session forwards files (including Windows **Open with** launches) and
+language/completion imports to the running editor, then activates its window.
+Already-open files select their existing tabs without replacing unsaved edits.
+A launch without filenames only activates the window. Different session
+directories still create independent workspaces. Forwarding is bounded to
+256 filenames and a 64 KiB request; failures are reported, not silently ignored.
 
 Close an older rstpd instance before opening this release with the same session.
 Version 1.1 reads version-1 sessions and saves version-2 sessions, including
@@ -314,8 +319,8 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\rstpd-1.4.1\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-1.4.1\rstpd.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-1.4.2\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-1.4.2\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -423,7 +428,7 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-1.4.1-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-1.4.2-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.

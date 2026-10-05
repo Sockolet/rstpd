@@ -8,7 +8,9 @@ use crate::{
     },
     editor::{self, DocumentHandle, Editor, Palette, sci::*},
     folder_search::{self, FolderOptions},
+    instance,
     languages::{self, Language},
+    launch::{self, Request as LaunchRequest},
     monitor::{self, Monitor},
     search_results::{self, Input as SearchInput, Link as ResultLink, Results as SearchResults},
     session::{self, DocumentSnapshot, RecoveryWorker, Session},
@@ -324,6 +326,7 @@ enum Event {
     Updated(usize),
     Character(usize, i32),
     Drop(Vec<PathBuf>),
+    Launch(LaunchRequest),
     Map(i32),
     SplitDrag(i32),
     ResultActivate,
@@ -650,6 +653,31 @@ unsafe fn paint_menu_rule(hwnd: HWND, supplied: HDC) {
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match message {
+            WM_COPYDATA => {
+                if l == 0 {
+                    return 0;
+                }
+                let data = &*(l as *const COPYDATASTRUCT);
+                if data.dwData != instance::COPYDATA_ID
+                    || data.lpData.is_null()
+                    || data.cbData as usize > launch::MAX_REQUEST_BYTES
+                    || EVENTS.with(|events| {
+                        events
+                            .borrow()
+                            .iter()
+                            .filter(|event| matches!(event, Event::Launch(_)))
+                            .count()
+                    }) >= launch::MAX_PENDING_REQUESTS
+                {
+                    return 0;
+                }
+                let bytes = std::slice::from_raw_parts(data.lpData.cast(), data.cbData as usize);
+                let Ok(request) = LaunchRequest::decode(bytes) else {
+                    return 0;
+                };
+                queue(Event::Launch(request));
+                return 1;
+            }
             PAINT_MENU_RULE => {
                 paint_menu_rule(hwnd, null_mut());
                 return 0;
@@ -5462,6 +5490,34 @@ impl App {
     }
     fn event(&mut self, event: Event) -> Result<()> {
         match event {
+            Event::Launch(request) => {
+                unsafe {
+                    if IsIconic(self.hwnd) != 0 {
+                        ShowWindow(self.hwnd, SW_RESTORE);
+                    }
+                    SetForegroundWindow(self.hwnd);
+                }
+                let mut failures = Vec::new();
+                for path in request.language_paths {
+                    if let Err(error) = self.import_language(&path) {
+                        failures.push(error);
+                    }
+                }
+                for path in request.paths {
+                    if let Err(error) = self.open_path(&path, None) {
+                        failures.push(error);
+                    }
+                }
+                for path in request.api_paths {
+                    if let Err(error) = self.import_api(&path) {
+                        failures.push(error);
+                    }
+                }
+                self.editor().focus();
+                if !failures.is_empty() {
+                    return Err(failures.join("\n"));
+                }
+            }
             Event::RenderError(error) => return Err(error),
             Event::Command(command) => self.command(command)?,
             Event::Resize => self.layout(),
@@ -5801,17 +5857,21 @@ pub fn run() -> Result<()> {
         };
         fs::create_dir_all(&directory)
             .map_err(|e| format!("Could not create recovery directory: {e}"))?;
-        let lock = OpenOptions::new()
+        let lock = match OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .share_mode(0)
             .open(directory.join("session.lock"))
-            .map_err(|e| {
-                format!(
-                    "Cannot lock the session. Another rstpd instance may already be running: {e}"
-                )
-            })?;
+        {
+            Ok(lock) => lock,
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {
+                let request = LaunchRequest::new(paths, language_paths, api_paths)?;
+                instance::forward(&directory, &request)?;
+                return Ok(());
+            }
+            Err(error) => return Err(format!("Cannot lock the session: {error}")),
+        };
         let recovery_path = directory.join("session.json");
         let (session, recovery_warning) = session::load_or_quarantine(&recovery_path)?;
         let class = wide("rstpd.Window");
@@ -6019,6 +6079,7 @@ pub fn run() -> Result<()> {
             return Err("Could not start the recovery timer.".into());
         }
         app.editor().focus();
+        let _endpoint = instance::Endpoint::new(hwnd, &directory)?;
         let mut message: MSG = zeroed();
         loop {
             let status = GetMessageW(&mut message, null_mut(), 0, 0);

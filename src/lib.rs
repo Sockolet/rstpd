@@ -6,8 +6,11 @@ pub mod core;
 #[cfg(windows)]
 pub mod editor;
 pub mod folder_search;
+#[cfg(windows)]
+pub mod instance;
 pub mod json_tools;
 pub mod languages;
+pub mod launch;
 pub mod markdown;
 pub mod monitor;
 pub mod search_results;
