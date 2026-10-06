@@ -17,13 +17,13 @@ Download the portable Windows ZIP from the
 [GitHub releases](https://github.com/Sockolet/rstpd/releases).
 For a source checkout, use the build instructions below to create `dist`.
 
-Open `dist\rstpd-1.4.3\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-1.4.3\rstpd.exe`. No installation or administrator access is needed.
+Open `dist\rstpd-1.4.4\rstpd.exe`, or extract the portable ZIP and open
+`rstpd-1.4.4\rstpd.exe`. No installation or administrator access is needed.
 Windows 10/11, x64. Keep the redistribution notices with the executable.
 
 ```powershell
-.\dist\rstpd-1.4.3\rstpd.exe
-.\dist\rstpd-1.4.3\rstpd.exe .\example.rs .\example.json
+.\dist\rstpd-1.4.4\rstpd.exe
+.\dist\rstpd-1.4.4\rstpd.exe .\example.rs .\example.json
 ```
 
 Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
@@ -91,6 +91,11 @@ or move it left/right. Pinned tabs show `[P]` and stay before unpinned tabs in
 their pane; dragging cannot cross that boundary. Pinning does not make the file read-only.
 Order and pin state are restored with the workspace. Double-click the unused
 tab-strip area immediately after the last tab to create an empty untitled tab.
+When tabs overflow, opening a new tab keeps it at the right of the visible
+strip with as many consecutive preceding tabs as fit to its left, rather than
+showing the newest tab alone. Resizing refills the strip, and each pane scrolls
+independently. Tab order/pins remain unchanged and the native overflow arrows
+still reach hidden tabs.
 
 The tab context menu provides **Open in split view**, which moves the
 right-clicked tab to the other pane, reusing an existing split.
@@ -322,8 +327,8 @@ using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
 ```powershell
-.\dist\rstpd-1.4.3\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-1.4.3\rstpd.exe --completion-api .\functions.xml .\example.rs
+.\dist\rstpd-1.4.4\rstpd.exe --import-language .\language.xml .\example.rstlang
+.\dist\rstpd-1.4.4\rstpd.exe --completion-api .\functions.xml .\example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -435,7 +440,7 @@ with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
 
 The script verifies pinned source archive hashes, extracts editor sources and
 language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-1.4.3-windows-x64.zip` with a SHA-256 sidecar. Release
+creates `dist\rstpd-1.4.4-windows-x64.zip` with a SHA-256 sidecar. Release
 directories are versioned so building does not overwrite a running older EXE.
 Rust dependencies are locked in `Cargo.lock`; the first build needs access to
 the Rust package registry. The native source archives are already included.
@@ -466,6 +471,8 @@ and recovery-quarantine contracts in this repository and the GTK sibling.
 
 `tests\ui_selection.ps1` exercises native pane groups, keyboard navigation,
 move/clone actions, comparison, and recovery with an isolated synthetic session.
+It also measures native overflow tab rectangles after adding tabs, keyboard
+navigation, theme changes, resizing and focus changes between split groups.
 Pass `-ChromeScreenshotDirectory .\target\ui-chrome` to also check native menus
 and theme boundaries. Both UI scripts accept `-Executable` and default to
 `target\release\rstpd.exe`.

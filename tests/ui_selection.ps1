@@ -80,7 +80,7 @@ public static class SelectionUi {
                 BitConverter.GetBytes(400).CopyTo(bytes, 24);
                 if (!WriteProcessMemory(process, remote, bytes, (UIntPtr)1024, out count)) throw new Exception("Cannot initialize tab buffer");
             }
-            if (SendMessage(tab, text ? 0x133Cu : 0x130Au, (IntPtr)index, remote) == IntPtr.Zero)
+            if (SendMessage(tab, text ? 0x133Cu : 0x130Au, (IntPtr)index, remote) == IntPtr.Zero && text)
                 throw new Exception("Cannot read native tab");
             if (!ReadProcessMemory(process, remote, bytes, (UIntPtr)1024, out count)) throw new Exception("Cannot inspect tab result");
             return bytes;
@@ -185,6 +185,33 @@ function SelectTab([int]$Index, [int]$Pane = 0) {
     $x = [int](([BitConverter]::ToInt32($bytes, 0) + [BitConverter]::ToInt32($bytes, 8)) / 2)
     $y = [int](([BitConverter]::ToInt32($bytes, 4) + [BitConverter]::ToInt32($bytes, 12)) / 2)
     Click $tab $x $y
+}
+function Assert-Overflow([IntPtr]$Tab, [int]$Selected, [string]$Stage) {
+    $bounds = [SelectionUi+Rect]::new()
+    [void][SelectionUi]::GetWindowRect($Tab, [ref]$bounds)
+    $width = $bounds.right - $bounds.left
+    $visible = @()
+    for ($index = 0; $index -le $Selected; $index++) {
+        $bytes = [SelectionUi]::TabData($Tab, $index, $false)
+        $leftEdge = [BitConverter]::ToInt32($bytes, 0)
+        $rightEdge = [BitConverter]::ToInt32($bytes, 8)
+        if ($leftEdge -ge 0 -and $rightEdge -gt $leftEdge -and $rightEdge -le $width) {
+            $visible += [PSCustomObject]@{Index=$index;Left=$leftEdge;Right=$rightEdge}
+        }
+    }
+    $dpi = [SelectionUi]::GetDpiForWindow($Tab)
+    $minimum = [Math]::Max(2, [Math]::Floor($width / (190 * $dpi / 96)) - 1)
+    if ($visible.Count -lt $minimum -or $visible[-1].Index -ne $Selected -or
+        (Send $Tab 0x130B) -ne $Selected) {
+        throw "${Stage}: overflow isolated/clipped the selected tab; width=$width visible=$($visible | ConvertTo-Json -Compress)"
+    }
+    for ($index = 1; $index -lt $visible.Count; $index++) {
+        if ($visible[$index].Index -ne $visible[$index - 1].Index + 1 -or
+            $visible[$index].Left -lt $visible[$index - 1].Right - 4) {
+            throw "${Stage}: visible tab order or geometry is incorrect"
+        }
+    }
+    Write-Output "PASS $Stage ($($visible.Count) consecutive tabs, selected $Selected at the right)"
 }
 function CheckChrome {
         [void](New-Item -ItemType Directory -Force $ChromeScreenshotDirectory)
@@ -478,6 +505,30 @@ try {
     Post $window 0x111 1005
     Post $window 0x111 1005
     if ((Send $tabs 0x1304) -ne 1 -or (Send $left 2006) -ne 0) { throw 'Closing final tab must leave a usable blank document' }
+    [void][SelectionUi]::SetWindowPos($window, [IntPtr]::Zero, 0, 0, 1100, 700, 0x16)
+    for ($index = 0; $index -lt 18; $index++) { Post $window 0x111 1001 }
+    Assert-Overflow $tabs 18 'newest overflow tab keeps its preceding tabs'
+    $labels = @(0..18 | ForEach-Object { [SelectionUi]::TabLabel($tabs, $_) })
+    Post $window 0x111 1061
+    Assert-Overflow $tabs 18 'theme refresh retains overflow viewport'
+    [void][SelectionUi]::SetWindowPos($window, [IntPtr]::Zero, 0, 0, 800, 600, 0x16)
+    Start-Sleep -Milliseconds 200
+    Assert-Overflow $tabs 18 'narrowing refills the selected tab viewport'
+    [void][SelectionUi]::SetWindowPos($window, [IntPtr]::Zero, 0, 0, 1500, 800, 0x16)
+    Start-Sleep -Milliseconds 200
+    Assert-Overflow $tabs 18 'widening reveals preceding tabs without changing order'
+    $after = @(0..18 | ForEach-Object { [SelectionUi]::TabLabel($tabs, $_) })
+    if (($labels -join '|') -cne ($after -join '|')) { throw 'Overflow viewport changed tab order' }
+    Keys '^+{TAB}'
+    Assert-Overflow $tabs 17 'previous-tab keyboard navigation retains adjacent tabs'
+    Keys '^{TAB}'
+    Assert-Overflow $tabs 18 'next-tab keyboard navigation returns to the rightmost tab'
+    Post $window 0x111 1050
+    for ($index = 0; $index -lt 8; $index++) { Post $window 0x111 1001 }
+    Assert-Overflow $rightTabs 8 'right pane has its own populated overflow viewport'
+    Click $left
+    Keys '^+{TAB}'
+    Assert-Overflow $tabs 17 'left pane overflow survives focus changes'
     Post $window 0x10
     if (!$app.WaitForExit(10000)) { throw 'Last-tab test app failed to close' }
     Write-Output "All native pane-group, clone, compare, keyboard and recovery regressions passed. Chrome exercised=$([bool]$ChromeScreenshotDirectory)."

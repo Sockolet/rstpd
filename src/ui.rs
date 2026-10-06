@@ -1243,6 +1243,11 @@ unsafe extern "system" fn tab_proc(
     unsafe {
         let pane = usize::from(GetDlgCtrlID(hwnd) == RIGHT_TAB_ID as i32);
         match message {
+            WM_SIZE => {
+                let result = DefSubclassProc(hwnd, message, w, l);
+                fill_tab_viewport(hwnd);
+                return result;
+            }
             WM_NCHITTEST => {
                 let mut point = POINT {
                     x: l as i16 as i32,
@@ -1520,6 +1525,51 @@ unsafe extern "system" fn tab_proc(
             _ => {}
         }
         DefSubclassProc(hwnd, message, w, l)
+    }
+}
+unsafe fn fill_tab_viewport(hwnd: HWND) {
+    unsafe {
+        let selected = SendMessageW(hwnd, TCM_GETCURSEL, 0, 0);
+        if selected < 0 {
+            return;
+        }
+        let mut item: RECT = zeroed();
+        let mut client: RECT = zeroed();
+        if GetClientRect(hwnd, &mut client) == 0
+            || SendMessageW(
+                hwnd,
+                TCM_GETITEMRECT,
+                selected as usize,
+                (&mut item as *mut RECT) as isize,
+            ) == 0
+            || item.right <= item.left
+        {
+            return;
+        }
+        let arrows = FindWindowExW(hwnd, null_mut(), wide("msctls_updown32").as_ptr(), null());
+        let mut right = client.right;
+        if !arrows.is_null() && IsWindowVisible(arrows) != 0 {
+            let mut bounds: RECT = zeroed();
+            GetWindowRect(arrows, &mut bounds);
+            let mut point = POINT {
+                x: bounds.left,
+                y: bounds.top,
+            };
+            ScreenToClient(hwnd, &mut point);
+            right = point.x.min(right);
+        }
+        let capacity = ((right - 4).max(0) / (item.right - item.left)).max(1) as usize;
+        let first = (selected as usize + 1).saturating_sub(capacity);
+        // The native arrows scroll in tab indices; keep the selection and item order intact.
+        SendMessageW(
+            hwnd,
+            WM_HSCROLL,
+            SB_THUMBPOSITION as usize | (first << 16),
+            arrows as isize,
+        );
+        if !arrows.is_null() {
+            SendMessageW(arrows, UDM_SETPOS32, 0, first as isize);
+        }
     }
 }
 unsafe fn empty_tab_space(hwnd: HWND, x: i32, y: i32) -> bool {
@@ -3171,6 +3221,7 @@ impl App {
                 }
                 SendMessageW(tab, TCM_SETCURSEL, selected, 0);
                 SendMessageW(tab, WM_SETREDRAW, 1, 0);
+                fill_tab_viewport(tab);
                 InvalidateRect(tab, null(), 1);
             }
         }
