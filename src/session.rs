@@ -44,6 +44,14 @@ pub struct DocumentSnapshot {
     pub caret: usize,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub preview_enabled: bool,
+    #[serde(default = "preview_ratio")]
+    pub preview_ratio: f32,
+}
+
+fn preview_ratio() -> f32 {
+    0.5
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -636,6 +644,8 @@ mod tests {
             disk_hash: None,
             caret: 3,
             pinned: true,
+            preview_enabled: true,
+            preview_ratio: 0.65,
         });
         session.monitor_files = true;
         session.compare_options.ignore_case = true;
@@ -643,6 +653,15 @@ mod tests {
         save(&path, &session).unwrap();
         assert_eq!(load(&path).unwrap().documents[0].text, "unsaved\0text");
         let restored = load(&path).unwrap();
+        assert!(restored.documents[0].preview_enabled);
+        assert_eq!(restored.documents[0].preview_ratio, 0.65);
+        let mut legacy = serde_json::to_value(&session).unwrap();
+        let document = legacy["documents"][0].as_object_mut().unwrap();
+        document.remove("preview_enabled");
+        document.remove("preview_ratio");
+        let legacy = parse(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!legacy.documents[0].preview_enabled);
+        assert_eq!(legacy.documents[0].preview_ratio, 0.5);
         assert!(
             restored.documents[0].pinned
                 && restored.monitor_files

@@ -88,6 +88,9 @@ const MAP: usize = 1051;
 const WRAP: usize = 1052;
 const ZOOM_RESET: usize = 1053;
 const EDITOR_FONT: usize = 1054;
+const MARKDOWN_PREVIEW: usize = 1055;
+const VIEW_FULL_PATH: usize = 1056;
+const COPY_FULL_PATH: usize = 1057;
 const THEME_SYSTEM: usize = 1060;
 const THEME_LIGHT: usize = 1061;
 const THEME_DARK: usize = 1062;
@@ -241,8 +244,11 @@ thread_local! {
     static TAB_DRAG: Cell<Option<TabDrag>> = const {Cell::new(None)};
     static SPLIT_BOUNDS: Cell<Option<RECT>> = const { Cell::new(None) };
     static SPLIT_DRAG_OFFSET: Cell<Option<i32>> = const { Cell::new(None) };
+    static PREVIEW_BOUNDS: Cell<Option<RECT>> = const { Cell::new(None) };
+    static PREVIEW_DRAG_OFFSET: Cell<Option<i32>> = const { Cell::new(None) };
     static PANEL_BOUNDS: RefCell<Vec<RECT>> = const { RefCell::new(Vec::new()) };
     static ACTIVE_PANE: Cell<usize> = const { Cell::new(0) };
+    static TAB_PATH_STATE: RefCell<Vec<(u64, bool, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 // The active pane's selected tab carries the accent stripe; repaint both bars when it moves.
@@ -308,6 +314,13 @@ fn split_hit(x: i32, y: i32) -> Option<i32> {
     })
 }
 
+fn preview_hit(x: i32, y: i32) -> Option<i32> {
+    PREVIEW_BOUNDS.with(Cell::get).and_then(|rect| {
+        (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+            .then_some(x - rect.left)
+    })
+}
+
 enum Event {
     RenderError(String),
     Command(usize),
@@ -329,6 +342,9 @@ enum Event {
     Launch(LaunchRequest),
     Map(i32),
     SplitDrag(i32),
+    PreviewDrag(i32),
+    PreviewTab(u64),
+    PathTab(u64, usize),
     ResultActivate,
     ResultsResize(i32),
     MoveTab(u64, usize),
@@ -853,6 +869,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                     divider.right = divider.left + (GetDpiForWindow(hwnd) as i32 / 96).max(1);
                     FillRect(w as HDC, &divider, border);
                 }
+                if let Some(mut divider) = PREVIEW_BOUNDS.with(Cell::get) {
+                    divider.left += (divider.right - divider.left) / 2;
+                    divider.right = divider.left + (GetDpiForWindow(hwnd) as i32 / 96).max(1);
+                    FillRect(w as HDC, &divider, border);
+                }
                 DeleteObject(border);
                 return 1;
             }
@@ -1053,6 +1074,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 }
             }
             WM_LBUTTONDOWN => {
+                if let Some(offset) = preview_hit(l as i16 as i32, (l >> 16) as i16 as i32) {
+                    PREVIEW_DRAG_OFFSET.with(|drag| drag.set(Some(offset)));
+                    SetCapture(hwnd);
+                    SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                    return 0;
+                }
                 if let Some(offset) = split_hit(l as i16 as i32, (l >> 16) as i16 as i32) {
                     SPLIT_DRAG_OFFSET.with(|drag| drag.set(Some(offset)));
                     SetCapture(hwnd);
@@ -1064,12 +1091,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 let mut point: POINT = zeroed();
                 GetCursorPos(&mut point);
                 ScreenToClient(hwnd, &mut point);
-                if split_hit(point.x, point.y).is_some() {
+                if split_hit(point.x, point.y).is_some() || preview_hit(point.x, point.y).is_some()
+                {
                     SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
                     return 1;
                 }
             }
             WM_MOUSEMOVE if GetCapture() == hwnd => {
+                if let Some(offset) = PREVIEW_DRAG_OFFSET.with(Cell::get) {
+                    SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                    queue(Event::PreviewDrag(l as i16 as i32 - offset));
+                }
                 if let Some(offset) = SPLIT_DRAG_OFFSET.with(Cell::get) {
                     SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
                     queue(Event::SplitDrag(l as i16 as i32 - offset));
@@ -1077,6 +1109,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 return 0;
             }
             WM_LBUTTONUP if GetCapture() == hwnd => {
+                if let Some(offset) = PREVIEW_DRAG_OFFSET.with(|drag| drag.take()) {
+                    queue(Event::PreviewDrag(l as i16 as i32 - offset));
+                }
                 if let Some(offset) = SPLIT_DRAG_OFFSET.with(|drag| drag.take()) {
                     queue(Event::SplitDrag(l as i16 as i32 - offset));
                 }
@@ -1084,9 +1119,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 return 0;
             }
             WM_CAPTURECHANGED => {
+                PREVIEW_DRAG_OFFSET.with(|drag| drag.set(None));
                 SPLIT_DRAG_OFFSET.with(|drag| drag.set(None));
             }
             WM_CANCELMODE => {
+                PREVIEW_DRAG_OFFSET.with(|drag| drag.set(None));
                 SPLIT_DRAG_OFFSET.with(|drag| drag.set(None));
                 if GetCapture() == hwnd {
                     ReleaseCapture();
@@ -1301,6 +1338,36 @@ unsafe extern "system" fn tab_proc(
                     AppendMenuW(menu, MF_STRING, TAB_PIN, wide("Pin / unpin tab").as_ptr());
                     AppendMenuW(menu, MF_STRING, TAB_LEFT, wide("Move tab left").as_ptr());
                     AppendMenuW(menu, MF_STRING, TAB_RIGHT, wide("Move tab right").as_ptr());
+                    AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        MARKDOWN_PREVIEW,
+                        wide("Toggle Markdown preview").as_ptr(),
+                    );
+                    let (has_path, preview) = TAB_PATH_STATE.with(|state| {
+                        state
+                            .borrow()
+                            .iter()
+                            .find(|entry| entry.0 == id)
+                            .map(|entry| (entry.1, entry.2))
+                            .unwrap_or_default()
+                    });
+                    CheckMenuItem(
+                        menu,
+                        MARKDOWN_PREVIEW as u32,
+                        MF_BYCOMMAND | if preview { MF_CHECKED } else { MF_UNCHECKED },
+                    );
+                    for (command, label) in [
+                        (VIEW_FULL_PATH, "View full path"),
+                        (COPY_FULL_PATH, "Copy full path"),
+                    ] {
+                        AppendMenuW(
+                            menu,
+                            MF_STRING | if has_path { 0 } else { MF_GRAYED },
+                            command,
+                            wide(label).as_ptr(),
+                        );
+                    }
                     AppendMenuW(menu, MF_SEPARATOR, 0, null());
                     AppendMenuW(
                         menu,
@@ -1331,7 +1398,11 @@ unsafe extern "system" fn tab_proc(
                         null(),
                     );
                     DestroyMenu(menu);
-                    if action as usize == TAB_PIN {
+                    if action as usize == MARKDOWN_PREVIEW {
+                        queue(Event::PreviewTab(id));
+                    } else if matches!(action as usize, VIEW_FULL_PATH | COPY_FULL_PATH) {
+                        queue(Event::PathTab(id, action as usize));
+                    } else if action as usize == TAB_PIN {
                         queue(Event::PinTab(id));
                     } else if action as usize == TAB_LEFT {
                         queue(Event::MoveTab(id, (index as usize).saturating_sub(1)));
@@ -1640,11 +1711,46 @@ fn canonical_target(path: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(path) {
         return canonical;
     }
+
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => fs::canonicalize(parent)
             .map(|parent| parent.join(name))
             .unwrap_or_else(|_| path.to_path_buf()),
         _ => path.to_path_buf(),
+    }
+}
+
+fn full_path_text(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let text = path.to_str()?;
+    Some(if let Some(unc) = text.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{unc}")
+    } else {
+        text.strip_prefix("\\\\?\\").unwrap_or(text).to_owned()
+    })
+}
+
+#[cfg(test)]
+mod full_path_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_paths_are_presented_without_verbatim_prefixes() {
+        assert_eq!(full_path_text(Path::new("Untitled 1")), None);
+        assert_eq!(
+            full_path_text(Path::new(r"\\?\C:\folder\é.md")),
+            Some(r"C:\folder\é.md".into())
+        );
+        assert_eq!(
+            full_path_text(Path::new(r"\\?\UNC\server\share\file.md")),
+            Some(r"\\server\share\file.md".into())
+        );
+        assert_eq!(
+            full_path_text(Path::new(r"C:\folder\file.md")),
+            Some(r"C:\folder\file.md".into())
+        );
     }
 }
 
@@ -1687,6 +1793,8 @@ struct Document {
     revision: u64,
     styled_revision: Option<u64>,
     last_edit: Instant,
+    preview_enabled: bool,
+    preview_ratio: f32,
 }
 
 struct SearchBar {
@@ -1772,6 +1880,11 @@ struct App {
     editors: [Editor; 2],
     scratch: Editor,
     map: Editor,
+    preview: Editor,
+    preview_key: Option<(u64, u64)>,
+    preview_document: Option<u64>,
+    preview_views:
+        std::collections::HashMap<u64, (String, crate::markdown_preview::SourceMap, usize)>,
     tabs: HWND,
     right_tabs: HWND,
     groups: [Vec<u64>; 2],
@@ -2093,6 +2206,8 @@ impl App {
                         (TAB_PIN, "Pin / unpin current tab"),
                         (TAB_LEFT, "Move tab left"),
                         (TAB_RIGHT, "Move tab right"),
+                        (VIEW_FULL_PATH, "View full path"),
+                        (COPY_FULL_PATH, "Copy full path"),
                         (0, ""),
                         (EXIT, "E&xit (keep session)"),
                     ],
@@ -2140,6 +2255,7 @@ impl App {
                     &[
                         (SPLIT, "Toggle split view\tCtrl+Alt+Right"),
                         (MAP, "Document map"),
+                        (MARKDOWN_PREVIEW, "Markdown preview (read-only)"),
                         (WRAP, "Word wrap"),
                         (EDITOR_FONT, "Editor &font..."),
                         (MONITOR_FILES, "Automatically reload external changes"),
@@ -2364,8 +2480,39 @@ impl App {
         Ok(())
     }
     fn update_symbol_checks(&self) {
+        TAB_PATH_STATE.with(|state| {
+            *state.borrow_mut() = self
+                .documents
+                .iter()
+                .map(|doc| {
+                    (
+                        doc.snapshot.id,
+                        doc.snapshot
+                            .path
+                            .as_deref()
+                            .and_then(full_path_text)
+                            .is_some(),
+                        doc.preview_enabled,
+                    )
+                })
+                .collect();
+        });
         unsafe {
             let menu = GetMenu(self.hwnd);
+            let has_path = !self.documents.is_empty()
+                && self.documents[self.index()]
+                    .snapshot
+                    .path
+                    .as_deref()
+                    .and_then(full_path_text)
+                    .is_some();
+            for id in [VIEW_FULL_PATH, COPY_FULL_PATH] {
+                EnableMenuItem(
+                    menu,
+                    id as u32,
+                    MF_BYCOMMAND | if has_path { MF_ENABLED } else { MF_GRAYED },
+                );
+            }
             for (id, checked) in [
                 (SYMBOL_SPACE, self.show_symbols.whitespace),
                 (SYMBOL_EOL, self.show_symbols.eol),
@@ -2375,6 +2522,7 @@ impl App {
                 (SYMBOL_INDENT, self.show_symbols.indent_guides),
                 (SYMBOL_WRAP, self.show_symbols.wrap_markers),
                 (MONITOR_FILES, self.monitor_files),
+                (MARKDOWN_PREVIEW, self.preview_visible()),
                 (COMPARE_IGNORE_SPACE, self.compare_options.ignore_whitespace),
                 (COMPARE_IGNORE_CASE, self.compare_options.ignore_case),
                 (
@@ -2400,6 +2548,7 @@ impl App {
         self.update_symbol_checks();
     }
     fn apply_theme(&mut self) {
+        self.preview_key = None;
         self.palette = Palette::new(match self.theme.as_str() {
             "dark" => true,
             "light" => false,
@@ -2513,6 +2662,7 @@ impl App {
             return;
         };
         self.editor_font = font;
+        self.preview_key = None;
         for editor in self.editors {
             editor.send(SCI_SETZOOM, 0, 0);
         }
@@ -2635,8 +2785,26 @@ impl App {
                 0
             };
             let map_w = if self.map_visible { self.scale(115) } else { 0 };
-            let content_w = (width - tree_w - map_w).max(1);
             let gap = self.scale(10).max(1);
+            let preview_w = if self.preview_visible() {
+                ((width - tree_w - map_w).max(0) as f32
+                    * (1.0 - self.documents[self.index()].preview_ratio)) as i32
+            } else {
+                0
+            };
+            let preview_gap = if self.preview_visible() { gap } else { 0 };
+            let content_w = (width - tree_w - map_w - preview_w - preview_gap).max(1);
+            PREVIEW_BOUNDS.with(|bounds| {
+                bounds.set(self.preview_visible().then_some(RECT {
+                    left: tree_w + content_w,
+                    right: tree_w + content_w + gap,
+                    top,
+                    bottom: top + body_h,
+                }))
+            });
+            if !self.preview_visible() {
+                PREVIEW_DRAG_OFFSET.with(|drag| drag.set(None));
+            }
             let left_w = if self.secondary.is_some() {
                 (content_w as f32 * self.ratio) as i32
             } else {
@@ -2652,7 +2820,7 @@ impl App {
             });
             if self.secondary.is_none() {
                 SPLIT_DRAG_OFFSET.with(|drag| drag.set(None));
-                if GetCapture() == self.hwnd {
+                if GetCapture() == self.hwnd && PREVIEW_DRAG_OFFSET.with(Cell::get).is_none() {
                     ReleaseCapture();
                 }
             }
@@ -2759,6 +2927,22 @@ impl App {
                 );
             }
             place_panel(self.map.hwnd, width - map_w, top, map_w, body_h, 0);
+            place_panel(
+                self.preview.hwnd,
+                width - map_w - preview_w,
+                top,
+                preview_w,
+                body_h,
+                0,
+            );
+            ShowWindow(
+                self.preview.hwnd,
+                if self.preview_visible() {
+                    SW_SHOWNA
+                } else {
+                    SW_HIDE
+                },
+            );
             ShowWindow(
                 self.map.hwnd,
                 if self.map_visible { SW_SHOWNA } else { SW_HIDE },
@@ -2965,6 +3149,8 @@ impl App {
         self.next_id += 1;
         snapshot.text = String::new();
         let dirty = snapshot.dirty;
+        let preview_enabled = snapshot.preview_enabled;
+        let preview_ratio = snapshot.preview_ratio.clamp(0.2, 0.8);
         self.groups[self.focused].push(snapshot.id);
         self.documents.push(Document {
             handle,
@@ -2975,6 +3161,8 @@ impl App {
             revision: 0,
             styled_revision: None,
             last_edit: Instant::now(),
+            preview_enabled,
+            preview_ratio,
         });
         if self.documents.len() == 1 {
             self.refresh_views()?;
@@ -3002,6 +3190,8 @@ impl App {
             disk_hash: None,
             caret: 0,
             pinned: false,
+            preview_enabled: false,
+            preview_ratio: 0.5,
         })
     }
     fn switch(&mut self, index: usize) -> Result<()> {
@@ -3044,6 +3234,7 @@ impl App {
         }
         let changed = self.focused != pane;
         self.focused = pane;
+        self.layout();
         self.configure_map();
         self.update_tabs();
         self.update_status();
@@ -3188,6 +3379,7 @@ impl App {
         self.map.send(SCI_SCROLLCARET, 0, 0);
     }
     fn update_tabs(&self) {
+        self.update_symbol_checks();
         select_pane(self.hwnd, self.focused);
         unsafe {
             for (pane, tab) in [self.tabs, self.right_tabs].into_iter().enumerate() {
@@ -3500,6 +3692,8 @@ impl App {
             disk_hash: Some(session::fingerprint(&bytes)),
             caret: 0,
             pinned: false,
+            preview_enabled: false,
+            preview_ratio: 0.5,
         })?;
         if let Some(note) = utf16_note {
             self.note(note);
@@ -3722,6 +3916,8 @@ impl App {
                 self.scratch.attach(&doc.handle);
                 let mut snapshot = doc.snapshot.clone();
                 snapshot.text = self.scratch.text()?;
+                snapshot.preview_enabled = doc.preview_enabled;
+                snapshot.preview_ratio = doc.preview_ratio;
                 Ok(snapshot)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -4439,6 +4635,8 @@ impl App {
             disk_hash: None,
             caret: 0,
             pinned: false,
+            preview_enabled: false,
+            preview_ratio: 0.5,
         })?;
         self.begin_compare(original, self.documents.len() - 1)
     }
@@ -4920,6 +5118,32 @@ impl App {
         Ok(())
     }
     fn command(&mut self, command: usize) -> Result<()> {
+        if matches!(command, VIEW_FULL_PATH | COPY_FULL_PATH) {
+            return self.path_action(self.documents[self.index()].snapshot.id, command);
+        }
+        if command == MARKDOWN_PREVIEW {
+            let index = self.index();
+            self.documents[index].preview_enabled = !self.documents[index].preview_enabled;
+            self.touch();
+            self.preview_key = None;
+            self.update_symbol_checks();
+            self.refresh_preview()?;
+            self.layout();
+            return Ok(());
+        }
+        if unsafe { GetFocus() } == self.preview.hwnd {
+            match command {
+                COPY => {
+                    self.preview.send(SCI_COPY, 0, 0);
+                    return Ok(());
+                }
+                SELECT_ALL => {
+                    self.preview.send(SCI_SELECTALL, 0, 0);
+                    return Ok(());
+                }
+                _ => self.editor().focus(),
+            }
+        }
         let results_focused = unsafe { GetFocus() } == self.results.editor.hwnd;
         if results_focused
             && matches!(
@@ -5393,7 +5617,120 @@ impl App {
         }
         Ok(false)
     }
+    fn preview_visible(&self) -> bool {
+        !self.documents.is_empty() && self.documents[self.index()].preview_enabled
+    }
+    fn path_action(&self, id: u64, command: usize) -> Result<()> {
+        let Some(path) = self
+            .documents
+            .iter()
+            .find(|doc| doc.snapshot.id == id)
+            .and_then(|doc| doc.snapshot.path.as_deref())
+            .and_then(full_path_text)
+        else {
+            return Ok(());
+        };
+        if command == COPY_FULL_PATH {
+            self.editor().copy_text(&path)?;
+            if clipboard_text(self.hwnd)? != path {
+                return Err("Could not copy the full path to the clipboard.".into());
+            }
+        } else {
+            unsafe {
+                MessageBoxW(
+                    self.hwnd,
+                    wide(&path).as_ptr(),
+                    wide("Full path (Ctrl+C to copy dialog)").as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_preview(&mut self) -> Result<()> {
+        if !self.preview_visible() {
+            return Ok(());
+        }
+        let doc = &self.documents[self.index()];
+        let key = (doc.snapshot.id, doc.revision);
+        if self.preview_key == Some(key) {
+            return Ok(());
+        }
+        if let Some(previous) = self.preview_document {
+            if let Some((_, mapping, anchor)) = self.preview_views.get_mut(&previous) {
+                *anchor = mapping.source(self.preview.viewport_position());
+            }
+        }
+        self.preview_views
+            .retain(|id, _| self.documents.iter().any(|doc| doc.snapshot.id == *id));
+        let language = self
+            .languages
+            .iter()
+            .find(|language| language.lexer == "markdown")
+            .unwrap_or(&self.languages[doc.language]);
+        self.preview
+            .theme_with_font(language, self.palette, &self.editor_font);
+        unsafe {
+            self.preview.send_raw(SCI_SETILEXER, 0, 0);
+        }
+        for margin in 0..5 {
+            self.preview.send(SCI_SETMARGINWIDTHN, margin, 0);
+        }
+        self.preview.send(SCI_SETWRAPMODE, 1, 0);
+        self.preview.send(SCI_SETCARETWIDTH, 0, 0);
+        self.preview.send(SCI_SETCARETLINEVISIBLE, 0, 0);
+        self.preview.send(SCI_SETUNDOCOLLECTION, 0, 0);
+        let family = std::ffi::CString::new("Segoe UI").unwrap();
+        for style in 0..256 {
+            if !matches!(style, 19..=21) {
+                unsafe {
+                    self.preview
+                        .send_raw(SCI_STYLESETFONT, style, family.as_ptr() as isize);
+                }
+            }
+        }
+        for (style, percent) in [(6, 180), (7, 155), (8, 135), (9, 120), (10, 110), (11, 100)] {
+            self.preview.send(
+                SCI_STYLESETSIZEFRACTIONAL,
+                style,
+                (self.editor_font.size_hundredths() * percent / 100) as isize,
+            );
+        }
+        let source = if self.editor().length() > crate::markdown_preview::MAX_PREVIEW_BYTES {
+            Err("Markdown preview is limited to 2 MiB. The source remains editable.".into())
+        } else {
+            self.editor().text()
+        };
+        let rendered = source
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|source| crate::markdown_preview::render_mapped(source));
+        match rendered {
+            Ok((text, highlight, mapping)) => {
+                let source = source?;
+                let anchor = self.preview_views.get(&key.0).map_or_else(
+                    || self.editor().viewport_position(),
+                    |(old, _, anchor)| crate::markdown_preview::rebase(old, &source, *anchor),
+                );
+                self.preview.set_read_only_text(&text)?;
+                self.preview.highlight(&highlight)?;
+                self.preview
+                    .restore_viewport_position(mapping.rendered(anchor));
+                self.preview_views.insert(key.0, (source, mapping, anchor));
+                self.preview_document = Some(key.0);
+            }
+            Err(error) => {
+                self.preview.set_read_only_text(&error)?;
+                self.preview.clear_styles();
+                self.preview_document = None;
+            }
+        }
+        self.preview_key = Some(key);
+        Ok(())
+    }
     fn tick(&mut self) -> Result<()> {
+        self.refresh_preview()?;
         self.poll_find_results()?;
         self.poll_monitor()?;
         while let Ok((revision, result)) = self.recovery.rx.try_recv() {
@@ -5577,6 +5914,7 @@ impl App {
             Event::Theme if self.theme == "system" => self.apply_theme(),
             Event::Theme => {}
             Event::Dpi => {
+                self.preview_key = None;
                 self.dpi = unsafe { GetDpiForWindow(self.hwnd) };
                 self.set_font();
                 self.apply_tab_item_size();
@@ -5587,6 +5925,9 @@ impl App {
                 self.focused = pane;
                 self.editor().focus();
                 select_pane(self.hwnd, pane);
+                self.layout();
+                self.configure_map();
+                self.update_symbol_checks();
                 self.update_status();
                 if changed {
                     self.touch();
@@ -5829,6 +6170,33 @@ impl App {
                 self.editor().send(SCI_GOTOLINE, line as usize, 0);
                 self.editor().focus();
             }
+            Event::PreviewTab(id) => {
+                if let Some(index) = self.documents.iter().position(|doc| doc.snapshot.id == id) {
+                    self.switch(index)?;
+                    self.command(MARKDOWN_PREVIEW)?;
+                }
+            }
+            Event::PathTab(id, command) => self.path_action(id, command)?,
+            Event::PreviewDrag(x) => {
+                if self.preview_visible() {
+                    let mut rect: RECT = unsafe { zeroed() };
+                    unsafe {
+                        GetClientRect(self.hwnd, &mut rect);
+                    }
+                    let tree = if self.tree_visible {
+                        self.scale(280).min(rect.right / 3)
+                    } else {
+                        0
+                    };
+                    let map = if self.map_visible { self.scale(115) } else { 0 };
+                    let index = self.index();
+                    self.documents[index].preview_ratio = ((x - tree + self.scale(10)) as f32
+                        / (rect.right - tree - map).max(1) as f32)
+                        .clamp(0.2, 0.8);
+                    self.touch();
+                    self.layout();
+                }
+            }
             Event::SplitDrag(x) => {
                 if self.secondary.is_some() {
                     let mut rect: RECT = unsafe { zeroed() };
@@ -5841,8 +6209,14 @@ impl App {
                         0
                     };
                     let map = if self.map_visible { self.scale(115) } else { 0 };
-                    self.ratio = ((x - tree) as f32 / (rect.right - tree - map).max(1) as f32)
-                        .clamp(0.2, 0.8);
+                    let available = rect.right - tree - map;
+                    let available = if self.preview_visible() {
+                        (available as f32 * self.documents[self.index()].preview_ratio) as i32
+                            - self.scale(10)
+                    } else {
+                        available
+                    };
+                    self.ratio = ((x - tree) as f32 / available.max(1) as f32).clamp(0.2, 0.8);
                     self.layout();
                 }
             }
@@ -5966,6 +6340,8 @@ pub fn run() -> Result<()> {
         let secondary = Editor::new(hwnd, instance, 102, false)?;
         let scratch = Editor::new(hwnd, instance, 103, false)?;
         let map = Editor::new(hwnd, instance, 104, false)?;
+        let preview = Editor::new(hwnd, instance, 106, false)?;
+        preview.send(SCI_SETMODEVENTMASK, 0, 0);
         let result_editor = Editor::new(hwnd, instance, RESULTS_EDITOR_ID, false)?;
         SetWindowSubclass(map.hwnd, Some(map_proc), 1, 0);
         RevokeDragDrop(map.hwnd);
@@ -5984,6 +6360,10 @@ pub fn run() -> Result<()> {
             editors: [primary, secondary],
             scratch,
             map,
+            preview,
+            preview_key: None,
+            preview_document: None,
+            preview_views: std::collections::HashMap::new(),
             tabs: null_mut(),
             right_tabs: null_mut(),
             groups: Default::default(),

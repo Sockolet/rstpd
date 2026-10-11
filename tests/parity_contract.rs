@@ -50,6 +50,8 @@ fn pane_session() -> Session {
                 disk_hash: None,
                 caret: 0,
                 pinned: index == 2,
+                preview_enabled: false,
+                preview_ratio: 0.5,
             })
             .collect(),
         pane_documents: [vec![2, 0], vec![2, 1]],

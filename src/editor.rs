@@ -320,6 +320,13 @@ impl Editor {
         );
         unsafe { self.send_raw(message, w, l) }
     }
+    pub fn copy_text(self, text: &str) -> Result<()> {
+        let text = CString::new(text).map_err(|_| "Clipboard text contains a NUL character.")?;
+        unsafe {
+            self.send_raw(SCI_COPYTEXT, text.as_bytes().len(), text.as_ptr() as isize);
+        }
+        Ok(())
+    }
     /// # Safety
     /// Pointer arguments must satisfy the selected Scintilla message's lifetime, size,
     /// ownership and mutability requirements. Only call on the control's UI thread.
@@ -485,6 +492,20 @@ impl Editor {
         let result = self.set_text(text);
         self.send(SCI_SETREADONLY, 1, 0);
         result
+    }
+    pub fn viewport_position(self) -> usize {
+        self.send(SCI_POSITIONFROMPOINT, 0, 0).max(0) as usize
+    }
+    pub fn restore_viewport_position(self, position: usize) {
+        let position = position.min(self.length());
+        let line = self.send(SCI_LINEFROMPOSITION, position, 0).max(0) as usize;
+        // EnsureLineVisible completes pending wrapping before coordinate queries.
+        self.send(SCI_ENSUREVISIBLE, line, 0);
+        let start = self.send(SCI_POSITIONFROMLINE, line, 0);
+        let y = self.send(SCI_POINTYFROMPOSITION, 0, position as isize);
+        let top = self.send(SCI_POINTYFROMPOSITION, 0, start);
+        let height = self.send(SCI_TEXTHEIGHT, line, 0).max(1);
+        self.send(SCI_SCROLLVERTICAL, line, (y - top).max(0) / height);
     }
     pub fn text(self) -> Result<String> {
         let len = self.length();

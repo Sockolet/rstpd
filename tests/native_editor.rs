@@ -18,6 +18,79 @@ fn font_family(editor: Editor, style: usize) -> String {
 }
 
 #[test]
+fn markdown_refresh_preserves_mapped_viewport_in_hidden_control() {
+    unsafe {
+        let instance = GetModuleHandleW(null());
+        editor::register(instance).unwrap();
+        // No top-level window is ever shown.
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let parent = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            null(),
+            WS_OVERLAPPED,
+            0,
+            0,
+            800,
+            600,
+            null_mut(),
+            null_mut(),
+            instance,
+            null_mut(),
+        );
+        assert!(!parent.is_null());
+        let source_editor = Editor::new(parent, instance, 101, false).unwrap();
+        let preview = Editor::new(parent, instance, 102, false).unwrap();
+        let preview_hwnd = GetDlgItem(parent, 102);
+        assert!(!preview_hwnd.is_null());
+        MoveWindow(preview_hwnd, 0, 0, 320, 240, 0);
+        assert_eq!(IsWindowVisible(parent), 0);
+        assert_eq!(IsWindowVisible(preview_hwnd), 0);
+        for margin in 0..5 {
+            preview.send(SCI_SETMARGINWIDTHN, margin, 0);
+        }
+        preview.send(SCI_SETWRAPMODE, 1, 0);
+        let old: String = (0..80).map(|i| format!("## Section {i}\n\nParagraph {i} has enough words to wrap across the narrow preview several times without changing source selection.\n\n")).collect();
+        source_editor.set_text(&old).unwrap();
+        source_editor.send(SCI_SETSEL, 20, 30);
+        let (text, highlight, map) = rstpd::markdown_preview::render_mapped(&old).unwrap();
+        preview.set_read_only_text(&text).unwrap();
+        preview.highlight(&highlight).unwrap();
+        preview.restore_viewport_position(text.find("Paragraph 40").unwrap() + 70);
+        let anchor = map.source(preview.viewport_position());
+        let saved_position = map.rendered(anchor);
+        preview.set_read_only_text("Another document\n").unwrap();
+        preview.restore_viewport_position(0);
+        assert_eq!(preview.viewport_position(), 0);
+        preview.set_read_only_text(&text).unwrap();
+        preview.highlight(&highlight).unwrap();
+        preview.restore_viewport_position(saved_position);
+        assert_eq!(preview.viewport_position(), saved_position);
+        for new in [
+            format!("# Inserted\n\n{old}"),
+            old.replace("## Section 3\n\n", ""),
+            old.replace("Paragraph 40", "Extra words inserted before Paragraph 40"),
+        ] {
+            let (text, highlight, map) = rstpd::markdown_preview::render_mapped(&new).unwrap();
+            let anchor = rstpd::markdown_preview::rebase(&old, &new, anchor);
+            preview.set_read_only_text(&text).unwrap();
+            preview.highlight(&highlight).unwrap();
+            let position = map.rendered(anchor);
+            preview.restore_viewport_position(position);
+            let top_position = preview.viewport_position();
+            assert!(top_position <= position);
+            assert_eq!(
+                preview.send(SCI_POINTYFROMPOSITION, 0, position as isize),
+                preview.send(SCI_POINTYFROMPOSITION, 0, top_position as isize),
+            );
+            assert_eq!(source_editor.send(SCI_GETANCHOR, 0, 0), 20);
+            assert_eq!(source_editor.send(SCI_GETCURRENTPOS, 0, 0), 30);
+        }
+        DestroyWindow(parent);
+    }
+}
+
+#[test]
 fn native_editing_unicode_split_selection_highlighting_and_undo() {
     unsafe {
         let instance = GetModuleHandleW(null());
@@ -71,6 +144,23 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
 
         let available = editor::available_lexers();
         let catalog = languages::catalog(&available);
+        let preview = Editor::new(parent, instance, 105, false).unwrap();
+        let markdown = catalog
+            .iter()
+            .find(|language| language.lexer == "markdown")
+            .unwrap();
+        preview.theme_with_font(markdown, Palette::new(true), &EditorFont::default());
+        preview.send_raw(SCI_SETILEXER, 0, 0);
+        let (rendered, styles) =
+            rstpd::markdown_preview::render("# Héllo\n\n**bold** and `code`").unwrap();
+        preview.set_read_only_text(&rendered).unwrap();
+        preview.highlight(&styles).unwrap();
+        assert_eq!(preview.send(SCI_GETREADONLY, 0, 0), 1);
+        assert_eq!(preview.send(SCI_GETSTYLEAT, 0, 0), 6);
+        assert_eq!(preview.text().unwrap(), rendered);
+        preview.send_raw(SCI_INSERTTEXT, 0, c"not allowed".as_ptr() as isize);
+        assert_eq!(preview.text().unwrap(), rendered);
+        assert_eq!(left.text().unwrap(), "one\ntwo\n");
         for language in &catalog {
             left.language(language, Palette::new(false)).unwrap();
             if language.uses_container() {

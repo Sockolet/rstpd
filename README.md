@@ -53,6 +53,7 @@ the new settings.
 | Show symbols | Independent whitespace, EOL, non-printing/control-character markers, Show All, indentation guides and wrap markers |
 | Highlighting | All 94 source-language inventory entries mapped, plus the full pinned Lexilla catalog; filename detection, mode selection, and data-only UDL 2.0/2.1 import |
 | Markdown | CommonMark/GFM parsing with visible headings, emphasis, links, lists, quotes, tasks, tables, inline/fenced/indented code and strikethrough |
+| Markdown preview | View > Markdown preview (read-only) opens a native rendered side panel for the active buffer, including unsaved edits; source remains editable and split view, JSON tree, map and search results remain available |
 | Completion | Keywords, local declarations, member/context suggestions, common built-in APIs, parameter hints and importable completion signatures |
 | Multiple edits | Alt+drag rectangular selection, Ctrl+click multiple carets, multi-selection typing and paste |
 | Split screen | Two editable views of the same document or two different documents |
@@ -68,6 +69,28 @@ the new settings.
 | Recovery | Background atomic snapshots of all tabs, including unnamed documents; restore after restart or crash |
 
 Each split pane owns its tab bar and independent selection.
+
+Markdown preview opens to the right of the source and refreshes automatically.
+Refresh keeps the visible content anchored to its Markdown source, including
+insertions and deletions above it and wrapped preview lines. Each open document
+remembers its preview position; a first preview starts at the source viewport.
+Manual preview scrolling is respected, without moving the source caret or
+forcing continuous scroll synchronization. Generated markers and decoded
+entities anchor to their source construct when there is no exact text match.
+Enable it from View or the clicked tab's right-click menu. The toggle and draggable
+divider position belong to that document, including its cloned views. Other tabs
+retain their normal editor and existing split layout; returning restores preview.
+It uses native styled text, not HTML or an embedded browser. Links show their
+destinations but are not opened; images show alt text and their destination,
+and raw HTML is displayed literally. Tables use text columns, not a grid.
+Preview is limited to 2 MiB of source with bounded rendering time; larger files
+remain editable. Each document's preview toggle and divider position are saved
+in the session and restored when the editor restarts. Older sessions start with
+preview disabled until you enable it from View or the tab menu.
+File and tab right-click menus offer **View full path** and **Copy full path**.
+File targets the active document; right-click targets the clicked document.
+View shows a native dialog (Ctrl+C copies the dialog text); Copy copies only the
+absolute file path. Both actions are disabled for unnamed documents.
 The icon toolbar keeps the same New, Open, Save, Find, Split, Compare, JSON tree
 and Document map actions. Hover for a descriptive tooltip and shortcut.
 Button names remain available to accessibility tools, and keyboard shortcuts

@@ -12,6 +12,7 @@ pub mod json_tools;
 pub mod languages;
 pub mod launch;
 pub mod markdown;
+pub mod markdown_preview;
 pub mod monitor;
 pub mod search_results;
 pub mod session;
